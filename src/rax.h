@@ -11,6 +11,11 @@
 #ifndef RAX_H
 #define RAX_H
 
+/* When USE_QUART is defined, use QuART instead of standard rax */
+#ifdef USE_QUART
+#include "quart_wrapper.h"
+#else
+
 #include <stdint.h>
 
 /* Representation of a radix tree as implemented in this file, that contains
@@ -201,4 +206,6 @@ void raxSetData(raxNode *n, void *data);
 int raxTest(int argc, char *argv[], int flags);
 #endif
 
-#endif
+#endif /* USE_QUART */
+
+#endif /* RAX_H */
