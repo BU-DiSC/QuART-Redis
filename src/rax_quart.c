@@ -6,6 +6,7 @@
 #include "server.h"
 #include "rax_quart.h"
 #include "rax.h"
+#include "rax_malloc.h"
 #include "zmalloc.h"
 #include <string.h>
 #include <errno.h>
@@ -16,177 +17,229 @@
 /* Declare internal rax functions we need for fp-based insertion */
 extern raxNode *raxAddChild(rax *rax, raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink);
 extern raxNode *raxCompressNode(rax *rax, raxNode *n, unsigned char *s, size_t len, raxNode **child);
-extern raxNode *raxNewNode(rax *rax, size_t children, int datafield);
 extern raxNode *raxReallocForData(rax *rax, raxNode *n, void *data);
-extern size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, void *ts);
+extern raxNode *raxNewNode(rax *rax, size_t children, int datafield);
+extern void raxFreeNode(rax *rax, raxNode *n);
+extern void *raxGetData(raxNode *n);
 
-/* Helper to get padding for a node */
-static inline size_t raxNodePadding(size_t size) {
-    return sizeof(void*) - (size+sizeof(raxNode)) % sizeof(void*);
-}
+/* rax node layout helpers (must match definitions in rax.c) */
+#define raxPadding(nodesize) ((sizeof(void*)-(((nodesize)+4) % sizeof(void*))) & (sizeof(void*)-1))
+#define raxNodeCurrentLength(n) ( \
+    sizeof(raxNode)+(n)->size+ \
+    raxPadding((n)->size)+ \
+    ((n)->iscompr ? sizeof(raxNode*) : sizeof(raxNode*)*(n)->size)+ \
+    (((n)->iskey && !(n)->isnull)*sizeof(void*)) \
+)
+#define raxNodeFirstChildPtr(n) ((raxNode**) ( \
+    (n)->data + \
+    (n)->size + \
+    raxPadding((n)->size)))
+#define raxNodeLastChildPtr(n) ((raxNode**) ( \
+    ((char*)(n)) + \
+    raxNodeCurrentLength(n) - \
+    sizeof(raxNode*) - \
+    (((n)->iskey && !(n)->isnull) ? sizeof(void*) : 0) \
+))
 
-/* Helper to get first child pointer */
-static inline raxNode **raxNodeFirstChildPtr(raxNode *n) {
-    return (raxNode**)((char*)n + sizeof(raxNode) + n->size + raxNodePadding(n->size));
-}
-
-/* Helper to get last child pointer */
-static inline raxNode **raxNodeLastChildPtr(raxNode *n) {
-    raxNode **cp = raxNodeFirstChildPtr(n);
-    if (n->iscompr) return cp;
-    return cp + (n->size - 1);
-}
-
-/* Helper to allocate a new node */
-static inline raxNode *raxQuartNewNode(rax *rax, size_t children, int datafield) {
-    size_t nodesize = sizeof(raxNode) + children + raxNodePadding(children) +
-                      sizeof(raxNode*) * children;
-    if (datafield) nodesize += sizeof(void*);
-    raxNode *node = zmalloc(nodesize);
-    if (node == NULL) return NULL;
-    node->iskey = 0;
-    node->isnull = 0;
-    node->iscompr = 0;
-    node->size = children;
-    if (rax->alloc_size) *rax->alloc_size += nodesize;
-    return node;
-}
-
-/* Helper to set data in a node */
-static inline void raxQuartSetData(raxNode *n, void *data) {
-    n->iskey = 1;
-    n->isnull = 0;
-    void **ndata = (void**)
-        ((char*)n + sizeof(*n) + n->size + raxNodePadding(n->size) +
-         sizeof(raxNode*) * (n->iscompr ? 1 : n->size));
-    memcpy(ndata, &data, sizeof(data));
-}
-
-/* Fast-path insertion starting from fp_ref
- * Like QuART's stail insert: if at depth 3, directly insert leaf into fp node
- * Returns 1 on success, 0 on failure (fall back to regular insert) */
+/* Fast-path insertion starting from fp_ref (QuART-style).
+ * Inserts starting at rq->fp_ref/rq->fp_depth instead of from the root.
+ * This is a specialized version of raxInsert() for fixed 4-byte keys.
+ *
+ * Returns 1 if inserted, 0 if key existed or on OOM (errno=ENOMEM on OOM).
+ */
 static int raxQuartFastPathInsert(raxQuart *rq, unsigned char *key_bytes, void *data) {
+    if (!rq || !rq->rax || !rq->fp_ref || !*rq->fp_ref) {
+        errno = 0;
+        return 0;
+    }
+
+    rax *rax = rq->rax;
     raxNode *h = *rq->fp_ref;
     raxNode **parentlink = rq->fp_ref;
-    int depth = rq->fp_depth;
-    rax *rax = rq->rax;
-    
-    /* Walk from fp_ref to find insertion point, similar to raxLowWalk but starting from fp */
-    while (h && depth < 4) {
-        unsigned char target = key_bytes[depth];
-        
+    size_t len = 4;
+    size_t i = (rq->fp_depth < 0) ? 0 : (size_t)rq->fp_depth;
+    size_t j = 0;
+    size_t usable;
+    size_t dummy, *alloc_size = &dummy;
+    if (rax->alloc_size) alloc_size = rax->alloc_size;
+
+    /* Walk from the cached node following the remaining bytes. */
+    while (h->size && i < len) {
+        unsigned char *v = h->data;
+
         if (h->iscompr) {
-            /* Compressed node - check if we match the prefix */
-            int match_len = 0;
-            unsigned char *v = h->data;
-            
-            while (match_len < h->size && depth + match_len < 4) {
-                if (v[match_len] != key_bytes[depth + match_len]) {
-                    /* Mismatch in compressed node - need split, fall back */
-                    return 0;
-                }
-                match_len++;
+            for (j = 0; j < h->size && i < len; j++, i++) {
+                if (v[j] != key_bytes[i]) break;
             }
-            
-            depth += match_len;
-            
-            if (match_len < h->size) {
-                /* Stopped in middle of compressed node - fall back */
-                return 0;
-            }
-            
-            /* Move to child of compressed node */
-            raxNode **children = raxNodeFirstChildPtr(h);
-            parentlink = children;
-            h = *children;
-            rq->fp_ref = children;
-            rq->fp_depth = depth;
+            if (j != h->size) break;
         } else {
-            /* Non-compressed node */
-            
-            /* Special case: if we're at depth 3 and this is a non-compressed node,
-             * we can directly insert the final byte as a new leaf child.
-             * This mirrors QuART's direct insertion at fp_depth == maxPrefixLength - 1 */
-            if (depth == 3) {
-                /* Check if the child already exists */
-                unsigned char *v = h->data;
-                for (int j = 0; j < h->size; j++) {
-                    if (v[j] == target) {
-                        /* Child exists, check if it needs data update */
-                        raxNode **children = raxNodeFirstChildPtr(h);
-                        raxNode *existing = children[j];
-                        if (existing->iskey) {
-                            /* Key already exists - fall back */
-                            return 0;
-                        }
-                        /* Mark as key and set data */
-                        existing = raxReallocForData(rax, existing, data);
-                        if (existing == NULL) return 0;
-                        raxSetData(existing, data);
-                        memcpy(&children[j], &existing, sizeof(existing));
-                        rax->numele++;
-                        
-                        /* Update fp to point to this child */
-                        rq->fp_ref = &children[j];
-                        rq->fp_depth = 4;
-                        return 1; /* SUCCESS! */
-                    }
-                }
-                
-                /* Child doesn't exist - add it using raxAddChild */
-                raxNode *child;
-                raxNode **new_parentlink;
-                raxNode *newh = raxAddChild(rax, h, target, &child, &new_parentlink);
-                if (newh == NULL) return 0;
-                
-                /* Update parent to point to the reallocated node */
-                memcpy(parentlink, &newh, sizeof(newh));
-                h = newh;
-                
-                /* Now child is the new leaf node - set its data */
-                child = raxReallocForData(rax, child, data);
-                if (child == NULL) return 0;
-                raxSetData(child, data);
-                memcpy(new_parentlink, &child, sizeof(child));
-                
-                rax->numnodes++;
-                rax->numele++;
-                
-                /* Update fp to point to the new child */
-                rq->fp_ref = new_parentlink;
-                rq->fp_depth = 4;
-                
-                return 1; /* SUCCESS! */
+            for (j = 0; j < h->size; j++) {
+                if (v[j] == key_bytes[i]) break;
             }
-            
-            /* Find matching child for navigation (depth < 3) */
-            unsigned char *v = h->data;
-            int found = -1;
-            for (int j = 0; j < h->size; j++) {
-                if (v[j] == target) {
-                    found = j;
-                    break;
-                }
-            }
-            
-            if (found >= 0) {
-                /* Found matching child - navigate to it */
-                depth++;
-                raxNode **children = raxNodeFirstChildPtr(h);
-                parentlink = &children[found];
-                rq->fp_ref = parentlink;
-                rq->fp_depth = depth;
-                h = children[found];
-            } else {
-                /* No matching child and depth < 3 - need to build path, fall back */
+            if (j == h->size) break;
+            i++;
+        }
+
+        raxNode **children = raxNodeFirstChildPtr(h);
+        if (h->iscompr) j = 0;
+        raxNode *next;
+        memcpy(&next, children + j, sizeof(next));
+        parentlink = children + j;
+        h = next;
+        j = 0;
+    }
+
+    /* Key exists / can be represented by current node. */
+    if (i == len && (!h->iscompr || j == 0)) {
+        if (!h->iskey) {
+            raxNode *newh = raxReallocForData(rax, h, data);
+            if (newh == NULL) {
+                errno = ENOMEM;
                 return 0;
             }
+            h = newh;
+            memcpy(parentlink, &h, sizeof(h));
+            raxSetData(h, data);
+            rax->numele++;
+            errno = 0;
+            return 1;
         }
+
+        /* Existing key: overwrite to match raxInsert() semantics. */
+        raxSetData(h, data);
+        errno = 0;
+        return 0;
     }
-    
-    /* If we're here, we've navigated the full path but couldn't insert directly
-     * Fall back to regular insert */
-    return 0;
+
+    /* Split compressed node on mismatch (ALGO 1 in raxGenericInsert). */
+    if (h->iscompr && i != len) {
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next;
+        memcpy(&next, childfield, sizeof(next));
+
+        size_t trimmedlen = j;
+        size_t postfixlen = h->size - j - 1;
+        int split_node_is_key = !trimmedlen && h->iskey && !h->isnull;
+        size_t nodesize;
+
+        raxNode *splitnode = raxNewNode(rax, 1, split_node_is_key);
+        raxNode *trimmed = NULL;
+        raxNode *postfix = NULL;
+
+        if (trimmedlen) {
+            nodesize = sizeof(raxNode) + trimmedlen + raxPadding(trimmedlen) + sizeof(raxNode*);
+            if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+            trimmed = rax_malloc_usable(nodesize, &usable);
+            *alloc_size += usable;
+        }
+
+        if (postfixlen) {
+            nodesize = sizeof(raxNode) + postfixlen + raxPadding(postfixlen) + sizeof(raxNode*);
+            postfix = rax_malloc_usable(nodesize, &usable);
+            *alloc_size += usable;
+        }
+
+        if (splitnode == NULL || (trimmedlen && trimmed == NULL) || (postfixlen && postfix == NULL)) {
+            raxFreeNode(rax, splitnode);
+            raxFreeNode(rax, trimmed);
+            raxFreeNode(rax, postfix);
+            errno = ENOMEM;
+            return 0;
+        }
+
+        splitnode->data[0] = h->data[j];
+
+        if (j == 0) {
+            if (h->iskey) {
+                void *ndata = raxGetData(h);
+                raxSetData(splitnode, ndata);
+            }
+            memcpy(parentlink, &splitnode, sizeof(splitnode));
+        } else {
+            trimmed->size = j;
+            memcpy(trimmed->data, h->data, j);
+            trimmed->iscompr = j > 1 ? 1 : 0;
+            trimmed->iskey = h->iskey;
+            trimmed->isnull = h->isnull;
+            if (h->iskey && !h->isnull) {
+                void *ndata = raxGetData(h);
+                raxSetData(trimmed, ndata);
+            }
+            raxNode **cp = raxNodeLastChildPtr(trimmed);
+            memcpy(cp, &splitnode, sizeof(splitnode));
+            memcpy(parentlink, &trimmed, sizeof(trimmed));
+            parentlink = cp;
+            rax->numnodes++;
+        }
+
+        if (postfixlen) {
+            postfix->iskey = 0;
+            postfix->isnull = 0;
+            postfix->size = postfixlen;
+            postfix->iscompr = postfixlen > 1;
+            memcpy(postfix->data, h->data + j + 1, postfixlen);
+            raxNode **cp = raxNodeLastChildPtr(postfix);
+            memcpy(cp, &next, sizeof(next));
+            rax->numnodes++;
+        } else {
+            postfix = next;
+        }
+
+        raxNode **splitchild = raxNodeLastChildPtr(splitnode);
+        memcpy(splitchild, &postfix, sizeof(postfix));
+
+        raxFreeNode(rax, h);
+        h = splitnode;
+    } else if (h->iscompr && i == len) {
+        /* Fixed-length 4-byte keys should never end inside a longer compressed node.
+         * If it happens (fp_depth misuse), bail out safely. */
+        errno = 0;
+        return 0;
+    }
+
+    /* Insert the missing suffix starting from node h (like raxGenericInsert). */
+    while (i < len) {
+        raxNode *child;
+
+        if (h->size == 0 && len - i > 1) {
+            size_t comprsize = len - i;
+            if (comprsize > RAX_NODE_MAX_SIZE) comprsize = RAX_NODE_MAX_SIZE;
+            raxNode *newh = raxCompressNode(rax, h, key_bytes + i, comprsize, &child);
+            if (newh == NULL) {
+                errno = ENOMEM;
+                return 0;
+            }
+            h = newh;
+            memcpy(parentlink, &h, sizeof(h));
+            parentlink = raxNodeLastChildPtr(h);
+            i += comprsize;
+        } else {
+            raxNode **new_parentlink;
+            raxNode *newh = raxAddChild(rax, h, key_bytes[i], &child, &new_parentlink);
+            if (newh == NULL) {
+                errno = ENOMEM;
+                return 0;
+            }
+            h = newh;
+            memcpy(parentlink, &h, sizeof(h));
+            parentlink = new_parentlink;
+            i++;
+        }
+        rax->numnodes++;
+        h = child;
+    }
+
+    raxNode *newh = raxReallocForData(rax, h, data);
+    if (newh == NULL) {
+        errno = ENOMEM;
+        return 0;
+    }
+    h = newh;
+    if (!h->iskey) rax->numele++;
+    raxSetData(h, data);
+    memcpy(parentlink, &h, sizeof(h));
+    errno = 0;
+    return 1;
 }
 
 /* Convert 32-bit key to byte array (big-endian) */
@@ -202,112 +255,73 @@ static inline uint8_t getKeyByte(uint32_t key, int pos) {
     return (key >> (24 - pos * 8)) & 0xFF;
 }
 
-/* Check if key is a forward bridge at byte position i */
-static inline int isForwardBridge(uint32_t key, uint32_t last_key, int i) {
-    uint8_t key_byte = getKeyByte(key, i);
-    uint8_t last_byte = getKeyByte(last_key, i);
+/* Update fp_ref/fp_depth to a good fp node for this key.
+ *
+ * QuART semantics: fp points to the deepest node on the fp path (ideally the
+ * node that begins exactly at depth 3 for 4-byte keys, so the last byte can be
+ * inserted as an edge from that node). If depth 3 lies inside a compressed
+ * node, we keep fp at the deepest node start <= 3.
+ */
+static void updateFpRefToKey(raxQuart *rq, unsigned char *key_bytes) {
+    if (!rq || !rq->rax || !rq->rax->head) return;
     
-    if (i == 0) {
-        /* Bridge at byte 0: key[0] = last[0]+1, key[1]=0, key[2]=0, last[1]=255, last[2]=255 */
-        return (key_byte == last_byte + 1) &&
-               (getKeyByte(key, 1) == 0) &&
-               (getKeyByte(key, 2) == 0) &&
-               (getKeyByte(last_key, 1) == 255) &&
-               (getKeyByte(last_key, 2) == 255);
-    } else if (i == 1) {
-        /* Bridge at byte 1: key[0]=last[0], key[1]=last[1]+1, key[2]=0, last[2]=255 */
-        return (getKeyByte(key, 0) == getKeyByte(last_key, 0)) &&
-               (key_byte == last_byte + 1) &&
-               (getKeyByte(key, 2) == 0) &&
-               (getKeyByte(last_key, 2) == 255);
-    } else if (i == 2) {
-        /* Bridge at byte 2: key[0]=last[0], key[1]=last[1], key[2]=last[2]+1 */
-        return (getKeyByte(key, 0) == getKeyByte(last_key, 0)) &&
-               (getKeyByte(key, 1) == getKeyByte(last_key, 1)) &&
-               (key_byte == last_byte + 1);
-    }
-    return 0;
-}
+    raxNode *h = rq->rax->head;
+    raxNode **parentlink = &rq->rax->head;
 
-/* Check if key is a backward bridge at byte position i */
-static inline int isBackwardBridge(uint32_t key, uint32_t last_key, int i) {
-    uint8_t key_byte = getKeyByte(key, i);
-    uint8_t last_byte = getKeyByte(last_key, i);
-    
-    if (i == 0) {
-        /* Bridge at byte 0: last[0] = key[0]+1, last[1]=0, last[2]=0, key[1]=255, key[2]=255 */
-        return (last_byte == key_byte + 1) &&
-               (getKeyByte(last_key, 1) == 0) &&
-               (getKeyByte(last_key, 2) == 0) &&
-               (getKeyByte(key, 1) == 255) &&
-               (getKeyByte(key, 2) == 255);
-    } else if (i == 1) {
-        /* Bridge at byte 1: key[0]=last[0], last[1]=key[1]+1, last[2]=0, key[2]=255 */
-        return (getKeyByte(key, 0) == getKeyByte(last_key, 0)) &&
-               (last_byte == key_byte + 1) &&
-               (getKeyByte(last_key, 2) == 0) &&
-               (getKeyByte(key, 2) == 255);
-    } else if (i == 2) {
-        /* Bridge at byte 2: key[0]=last[0], key[1]=last[1], last[2]=key[2]+1 */
-        return (getKeyByte(key, 0) == getKeyByte(last_key, 0)) &&
-               (getKeyByte(key, 1) == getKeyByte(last_key, 1)) &&
-               (last_byte == key_byte + 1);
-    }
-    return 0;
-}
+    int depth = 0;            /* How many key bytes consumed. */
+    int node_depth = 0;       /* Depth where current node begins. */
+    raxNode **best_link = parentlink;
+    int best_depth = 0;
 
-/* Check if this is a sequential fast-path insertion */
-static int isFastPathInsert(raxQuart *rq, uint32_t key) {
-    if (!rq->has_last_key) return 0;
-    
-    uint32_t last = rq->last_key;
-    
-    /* Check direction */
-    if (rq->direction) {
-        /* Forward direction: check for sequential or bridge */
-        if (key == last + 1) return 1;  /* Perfect sequential */
-        
-        /* Check for bridge at each byte level */
-        for (int i = 0; i < 3; i++) {
-            /* First check if bytes match up to position i */
-            int bytes_match = 1;
-            for (int j = 0; j < i; j++) {
-                if (getKeyByte(key, j) != getKeyByte(last, j)) {
-                    bytes_match = 0;
+    /* Walk the tree following key_bytes. Track the deepest node start <= 3. */
+    while (h && depth < 4) {
+        if (node_depth <= 3 && node_depth >= best_depth) {
+            best_link = parentlink;
+            best_depth = node_depth;
+        }
+
+        if (node_depth == 3) break; /* Ideal fp node. */
+
+        if (h->iscompr) {
+            unsigned char *v = h->data;
+            int match_len = 0;
+            while (match_len < (int)h->size && depth < 4 && v[match_len] == key_bytes[depth]) {
+                match_len++;
+                depth++;
+                if (depth == 3) {
+                    /* Depth 3 is inside this compressed node: keep fp at its start. */
                     break;
                 }
             }
-            if (!bytes_match) continue;
-            
-            /* Check if this is a bridge */
-            if (isForwardBridge(key, last, i)) {
-                rq->bridge_detected++;
-                return 1;
-            }
-        }
-    } else {
-        /* Backward direction: check for descending sequential or bridge */
-        if (key == last - 1) return 1;  /* Perfect sequential */
-        
-        /* Check for backward bridge at each byte level */
-        for (int i = 0; i < 3; i++) {
-            int bytes_match = 1;
-            for (int j = 0; j < i; j++) {
-                if (getKeyByte(key, j) != getKeyByte(last, j)) {
-                    bytes_match = 0;
+            if (match_len < (int)h->size && depth < 3) break; /* Mismatch before fp point. */
+            if (depth >= 3) break;
+
+            raxNode **cp = raxNodeFirstChildPtr(h);
+            if (!cp || !*cp) break;
+            parentlink = cp;
+            h = *cp;
+            node_depth = depth;
+        } else {
+            unsigned char *v = h->data;
+            int found = -1;
+            for (int k = 0; k < (int)h->size; k++) {
+                if (v[k] == key_bytes[depth]) {
+                    found = k;
                     break;
                 }
             }
-            if (!bytes_match) continue;
-            
-            if (isBackwardBridge(key, last, i)) {
-                rq->bridge_detected++;
-                return 1;
-            }
+            if (found < 0) break;
+            depth++;
+            raxNode **children = raxNodeFirstChildPtr(h);
+            if (!children || !children[found]) break;
+            parentlink = &children[found];
+            h = children[found];
+            node_depth = depth;
         }
     }
-    
-    return 0;
+
+    rq->fp_ref = best_link;
+    rq->fp_depth = best_depth;
 }
 
 raxQuart *raxQuartNew(void) {
@@ -340,77 +354,232 @@ int raxQuartInsert(raxQuart *rq, uint32_t key, void *data) {
     unsigned char key_bytes[4];
     keyToBytes(key, key_bytes);
     
-    /* First insertion - always insert normally and set up fp */
+    /* First insertion - always insert normally and change fp (like QuART: insert_recursive_change_fp) */
     if (!rq->has_last_key) {
         int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
         if (result) {
             rq->last_key = key;
             rq->has_last_key = 1;
-            rq->fp_ref = &rq->rax->head;
-            rq->fp_depth = 0;
+            /* Change fp to the newly inserted key */
+            updateFpRefToKey(rq, key_bytes);
             rq->regular_inserts++;
         }
         return result;
     }
     
-    /* Check if this is a fast-path insertion */
-    int is_fp = isFastPathInsert(rq, key);
+    /* QuART_stail_reset_bidir logic: byte-by-byte comparison with last_key */
+    uint32_t leafValue = rq->last_key;
     
-    if (is_fp) {
-        /* Fast path: sequential or bridge insertion */
-        rq->fp_inserts++;
-        rq->reset_counter = DEFAULT_RESET_THRESHOLD;  /* Reset counter on fast-path */
-        
-        /* Try to insert starting from fp_ref */
-        int fp_success = raxQuartFastPathInsert(rq, key_bytes, data);
-        
-        if (fp_success) {
-            /* Fast-path insertion succeeded */
-            rq->last_key = key;
-            return 1;
-        }
-        
-        /* Fast-path insertion failed or needs regular insert to complete
-         * Do regular insert but we've already updated fp_ref to a better position */
-        int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
-        rq->last_key = key;
-        return result;
-    } else {
-        /* Not a fast-path insertion */
-        rq->regular_inserts++;
-        rq->reset_counter--;
-        
-        /* Check if we need to reset the fast-path */
-        if (rq->reset_counter <= 0) {
-            rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-            rq->resets++;
-            /* Reset direction to forward and fp to root */
-            rq->direction = 1;
-            rq->fp_ref = &rq->rax->head;
-            rq->fp_depth = 0;
-        }
-        
-        /* Update direction based on key comparison */
-        if (rq->has_last_key) {
-            /* Check last byte to determine direction */
-            uint8_t last_byte3 = rq->last_key & 0xFF;
-            uint8_t key_byte3 = key & 0xFF;
+    if (rq->direction) {
+        /* FORWARD DIRECTION: Check each byte (excluding last byte) */
+        for (int i = 0; i < 3; i++) {
+            uint8_t leafByte = getKeyByte(leafValue, i);
+            uint8_t keyByte = getKeyByte(key, i);
             
-            /* Check if higher bytes match */
-            if ((rq->last_key >> 8) == (key >> 8)) {
-                if (key_byte3 < last_byte3) {
-                    rq->direction = 0;  /* Switch to backward */
-                } else if (key_byte3 > last_byte3) {
-                    rq->direction = 1;  /* Switch to forward */
+            if (keyByte == leafByte) {
+                /* Bytes match, continue to next byte */
+                continue;
+            }
+            else if (keyByte < leafByte) {
+                /* Key byte < leaf byte: preserve fp, decrement counter (not on fp path) */
+                rq->reset_counter--;
+                rq->regular_inserts++;
+                int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                /* Preserve fp: do not update rq->last_key, but refresh fp_ref in case of reallocations. */
+                unsigned char leaf_bytes[4];
+                keyToBytes(rq->last_key, leaf_bytes);
+                updateFpRefToKey(rq, leaf_bytes);
+                return result;
+            }
+            else {
+                /* Key byte > leaf byte: check for bridge or reset */
+                
+                /* Check if this is a bridge value */
+                int is_bridge = 0;
+                if (i == 0) {
+                    /* Bridge at byte 0: key[0]=leaf[0]+1, key[1]=0, key[2]=0, leaf[1]=255, leaf[2]=255 */
+                    is_bridge = (keyByte == leafByte + 1) &&
+                                (getKeyByte(key, 1) == 0) &&
+                                (getKeyByte(key, 2) == 0) &&
+                                (getKeyByte(leafValue, 1) == 255) &&
+                                (getKeyByte(leafValue, 2) == 255);
+                } else if (i == 1) {
+                    /* Bridge at byte 1: key[0]=leaf[0], key[1]=leaf[1]+1, key[2]=0, leaf[2]=255 */
+                    is_bridge = (keyByte == leafByte + 1) &&
+                                (getKeyByte(key, 2) == 0) &&
+                                (getKeyByte(key, 0) == getKeyByte(leafValue, 0)) &&
+                                (getKeyByte(leafValue, 2) == 255);
+                } else if (i == 2) {
+                    /* Bridge at byte 2: key[0]=leaf[0], key[1]=leaf[1], key[2]=leaf[2]+1 */
+                    is_bridge = (keyByte == leafByte + 1) &&
+                                (getKeyByte(key, 0) == getKeyByte(leafValue, 0)) &&
+                                (getKeyByte(key, 1) == getKeyByte(leafValue, 1));
+                }
+                
+                if (is_bridge) {
+                    /* Bridge detected: reset counter, reset fp to root, then change fp to new key */
+                    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
+                    rq->bridge_detected++;
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    if (errno != ENOMEM) {
+                        /* Change fp to the bridge destination key (even if it already existed). */
+                        updateFpRefToKey(rq, key_bytes);
+                        rq->last_key = key;
+                    }
+                    return result;
+                }
+                /* Check if counter expired */
+                else if (rq->reset_counter <= 0) {
+                    /* Force fp change and reset */
+                    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
+                    rq->resets++;
+                    rq->fp_ref = &rq->rax->head;
+                    rq->fp_depth = 0;
+                    rq->direction = 1;  /* Reset to forward */
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    if (errno != ENOMEM) {
+                        updateFpRefToKey(rq, key_bytes);
+                        rq->last_key = key;
+                    }
+                    return result;
+                }
+                else {
+                    /* Not a bridge and counter not expired: preserve fp, decrement counter */
+                    rq->reset_counter--;
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    unsigned char leaf_bytes[4];
+                    keyToBytes(rq->last_key, leaf_bytes);
+                    updateFpRefToKey(rq, leaf_bytes);
+                    return result;
                 }
             }
         }
         
-        /* Perform regular insertion */
-        int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
-        rq->last_key = key;
-        return result;
+        /* All first 3 bytes match - check last byte for direction change */
+        uint8_t lastLeafByte = leafValue & 0xFF;
+        uint8_t lastKeyByte = key & 0xFF;
+        if (lastKeyByte < lastLeafByte) {
+            /* Direction change: switch to backward */
+            rq->direction = 0;
+            /* Update last_key's last byte for backward tracking */
+            rq->last_key = (leafValue & 0xFFFFFF00) | lastKeyByte;
+        }
     }
+    else {
+        /* BACKWARD DIRECTION: Check each byte (excluding last byte) */
+        for (int i = 0; i < 3; i++) {
+            uint8_t leafByte = getKeyByte(leafValue, i);
+            uint8_t keyByte = getKeyByte(key, i);
+            
+            if (keyByte == leafByte) {
+                /* Bytes match, continue to next byte */
+                continue;
+            }
+            else if (keyByte > leafByte) {
+                /* Key byte > leaf byte: preserve fp, decrement counter (going wrong direction) */
+                rq->reset_counter--;
+                rq->regular_inserts++;
+                int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                unsigned char leaf_bytes[4];
+                keyToBytes(rq->last_key, leaf_bytes);
+                updateFpRefToKey(rq, leaf_bytes);
+                return result;
+            }
+            else {
+                /* Key byte < leaf byte: check for backward bridge or reset */
+                
+                /* Check if this is a backward bridge value */
+                int is_bridge = 0;
+                if (i == 0) {
+                    /* Backward bridge at byte 0: leaf[0]=key[0]+1, leaf[1]=0, leaf[2]=0, key[1]=255, key[2]=255 */
+                    is_bridge = (leafByte == keyByte + 1) &&
+                                (getKeyByte(leafValue, 1) == 0) &&
+                                (getKeyByte(leafValue, 2) == 0) &&
+                                (getKeyByte(key, 1) == 255) &&
+                                (getKeyByte(key, 2) == 255);
+                } else if (i == 1) {
+                    /* Backward bridge at byte 1: key[0]=leaf[0], leaf[1]=key[1]+1, leaf[2]=0, key[2]=255 */
+                    is_bridge = (leafByte == keyByte + 1) &&
+                                (getKeyByte(leafValue, 2) == 0) &&
+                                (getKeyByte(key, 0) == getKeyByte(leafValue, 0)) &&
+                                (getKeyByte(key, 2) == 255);
+                } else if (i == 2) {
+                    /* Backward bridge at byte 2: key[0]=leaf[0], key[1]=leaf[1], leaf[2]=key[2]+1 */
+                    is_bridge = (leafByte == keyByte + 1) &&
+                                (getKeyByte(key, 0) == getKeyByte(leafValue, 0)) &&
+                                (getKeyByte(key, 1) == getKeyByte(leafValue, 1));
+                }
+                
+                if (is_bridge) {
+                    /* Bridge detected: reset counter, reset fp, change fp */
+                    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
+                    rq->bridge_detected++;
+                    rq->fp_ref = &rq->rax->head;
+                    rq->fp_depth = 0;
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    if (errno != ENOMEM) {
+                        updateFpRefToKey(rq, key_bytes);
+                        rq->last_key = key;
+                    }
+                    return result;
+                }
+                /* Check if counter expired */
+                else if (rq->reset_counter <= 0) {
+                    /* Force fp change and reset */
+                    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
+                    rq->resets++;
+                    rq->fp_ref = &rq->rax->head;
+                    rq->fp_depth = 0;
+                    rq->direction = 1;  /* Reset to forward */
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    if (errno != ENOMEM) {
+                        updateFpRefToKey(rq, key_bytes);
+                        rq->last_key = key;
+                    }
+                    return result;
+                }
+                else {
+                    /* Not a bridge and counter not expired: preserve fp, decrement counter */
+                    rq->reset_counter--;
+                    rq->regular_inserts++;
+                    int result = raxInsert(rq->rax, key_bytes, 4, data, NULL);
+                    unsigned char leaf_bytes[4];
+                    keyToBytes(rq->last_key, leaf_bytes);
+                    updateFpRefToKey(rq, leaf_bytes);
+                    return result;
+                }
+            }
+        }
+        
+        /* All first 3 bytes match - check last byte for direction change */
+        uint8_t lastLeafByte = leafValue & 0xFF;
+        uint8_t lastKeyByte = key & 0xFF;
+        if (lastKeyByte > lastLeafByte) {
+            /* Direction change: switch to forward */
+            rq->direction = 1;
+            /* Update last_key's last byte for forward tracking */
+            rq->last_key = (leafValue & 0xFFFFFF00) | lastKeyByte;
+        }
+    }
+    
+    /* If we reach here, it means fp insert will happen (all bytes sequential) */
+    /* This is the fast-path: reset counter and count as fp_insert */
+    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
+    rq->fp_inserts++;
+
+    /* Real fast-path insertion from the fp node (no detection-only fallback). */
+    int result = raxQuartFastPathInsert(rq, key_bytes, data);
+    if (errno == ENOMEM) return 0;
+
+    /* Fast-path updates fp_leaf to the new key (even if it already existed). */
+    rq->last_key = key;
+    updateFpRefToKey(rq, key_bytes);
+    return result;
 }
 
 int raxQuartFind(raxQuart *rq, uint32_t key, void **value) {

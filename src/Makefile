@@ -390,6 +390,8 @@ REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
 REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
 REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
 BENCH_RAX_QUART_NAME=bench-rax-quart$(PROG_SUFFIX)
+TEST_RAX_QUART_WORKLOADS_NAME=test-rax-quart-workloads$(PROG_SUFFIX)
+TEST_REDIS_STREAM_WORKLOADS_NAME=test-redis-stream-workloads$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
@@ -475,6 +477,20 @@ $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
 # bench-rax-quart
 $(BENCH_RAX_QUART_NAME): bench_rax_quart.o rax.o rax_quart.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
 	$(REDIS_LD) -o $@ $^ $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
+
+# test-rax-quart-workloads (source lives in test-standalone/)
+../test-standalone/test_rax_quart_workloads.o: ../test-standalone/test_rax_quart_workloads.c .make-prerequisites
+	$(REDIS_CC) -MMD -o $@ -c $<
+
+$(TEST_RAX_QUART_WORKLOADS_NAME): ../test-standalone/test_rax_quart_workloads.o rax.o rax_quart.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
+	$(REDIS_LD) -o $@ $^ $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
+
+# test-redis-stream-workloads (source lives in test-redis/)
+../test-redis/test_redis_stream_workloads.o: ../test-redis/test_redis_stream_workloads.c .make-prerequisites
+	$(REDIS_CC) -MMD -o $@ -c $<
+
+$(TEST_REDIS_STREAM_WORKLOADS_NAME): ../test-redis/test_redis_stream_workloads.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
+	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
 
 # measure-rax-depth
 measure-rax-depth: measure_rax_depth.o rax.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o

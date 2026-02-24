@@ -42,4 +42,13 @@ Makefile.dep
 .ccls-cache/*
 compile_commands.json
 redis.code-workspace
+
 Qu-ART/
+BoDS/
+test-standalone/results/
+test-redis/results/
+redis-server-quart
+bench-rax-quart
+test-rax-quart-workloads
+test-redis-stream-workloads
+.nfs*
