@@ -15,7 +15,7 @@ mkdir -p "$LOGDIR"
 
 # Configuration
 N=500000000  # Number of keys in workload files
-WORKLOAD_DIR="../../bods/workloads"
+WORKLOAD_DIR="/home/grad1/cgokmen/bods/workloads/"
 REPEAT=3  # Number of repetitions per test
 
 # K,L values to test (where K=L for each test)

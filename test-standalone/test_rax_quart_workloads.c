@@ -106,11 +106,16 @@ void test_rax_quart(uint32_t *keys, size_t num_keys, size_t query_count, int ver
                     uint64_t *fp_inserts, uint64_t *regular_inserts,
                     uint64_t *bridges, uint64_t *resets) {
     raxQuart *rq = raxQuartNew();
+    unsigned char key_bytes[4];
     
     // Insertion test
     long long start = get_time_ns();
     for (size_t i = 0; i < num_keys; i++) {
-        raxQuartInsert(rq, keys[i], (void*)(uintptr_t)(i+1));
+        key_bytes[0] = (keys[i] >> 24) & 0xFF;
+        key_bytes[1] = (keys[i] >> 16) & 0xFF;
+        key_bytes[2] = (keys[i] >> 8) & 0xFF;
+        key_bytes[3] = keys[i] & 0xFF;
+        raxQuartInsert(rq, key_bytes, 4, (void*)(uintptr_t)(i+1), NULL);
     }
     long long end = get_time_ns();
     *insert_time = end - start;
@@ -136,8 +141,12 @@ void test_rax_quart(uint32_t *keys, size_t num_keys, size_t query_count, int ver
     for (size_t i = 0; i < query_count; i++) {
         size_t idx = i * stride;
         if (idx >= num_keys) idx = num_keys - 1;
+        key_bytes[0] = (keys[idx] >> 24) & 0xFF;
+        key_bytes[1] = (keys[idx] >> 16) & 0xFF;
+        key_bytes[2] = (keys[idx] >> 8) & 0xFF;
+        key_bytes[3] = keys[idx] & 0xFF;
         void *value;
-        raxQuartFind(rq, keys[idx], &value);
+        raxQuartFind(rq, key_bytes, 4, &value);
     }
     end = get_time_ns();
     *query_time = end - start;
