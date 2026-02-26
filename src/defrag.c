@@ -774,10 +774,10 @@ int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) 
     serverAssert(ob->type == OBJ_STREAM && ob->encoding == OBJ_ENCODING_STREAM);
 
     stream *s = ob->ptr;
-    raxStart(&ri,s->rax);
+    raxStart(&ri,s->tree.rax);
     if (*cursor == 0) {
         /* if cursor is 0, we start new iteration */
-        defragRaxNode(&s->rax->head, NULL);
+        defragRaxNode(&s->tree.rax->head, NULL);
         /* assign the iterator node callback before the seek, so that the
          * initial nodes that are processed till the first item are covered */
         ri.node_cb = defragRaxNode;
@@ -1007,14 +1007,14 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
         ob->ptr = s = news;
 
     /* Update rax back-pointer to new stream */
-    s->rax->alloc_size = &s->alloc_size;
-    if (raxSize(s->rax) > server.active_defrag_max_scan_fields) {
-        rax *newrax = activeDefragAlloc(s->rax);
+    s->tree.rax->alloc_size = &s->alloc_size;
+    if (raxSize(s->tree.rax) > server.active_defrag_max_scan_fields) {
+        rax *newrax = activeDefragAlloc(s->tree.rax);
         if (newrax)
-            s->rax = newrax;
+            s->tree.rax = newrax;
         defragLater(ctx, ob);
     } else
-        defragRadixTree(&s->rax, 1, NULL, NULL);
+        defragRadixTree(&s->tree.rax, 1, NULL, NULL);
 
     if (s->cgroups) {
         /* Update cgroups back-pointer to new stream */

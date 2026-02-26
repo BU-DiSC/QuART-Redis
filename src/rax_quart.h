@@ -32,13 +32,14 @@ typedef struct raxQuart {
 
 /* Create a new rax with QuART optimizations */
 raxQuart *raxQuartNew(void);
+raxQuart *raxQuartNewWithMetadata(int metaSize, size_t *alloc_size);
 
 /* Insert with bridge detection and reset logic */
-int raxQuartInsert(raxQuart *rq, uint32_t key, void *data);
+int raxQuartInsert(raxQuart *rq, unsigned char *key, size_t keylen, void *data, void **old);
 
 /* Standard rax operations */
-int raxQuartFind(raxQuart *rq, uint32_t key, void **value);
-int raxQuartRemove(raxQuart *rq, uint32_t key, void **old);
+int raxQuartFind(raxQuart *rq, unsigned char *key, size_t keylen, void **value);
+int raxQuartRemove(raxQuart *rq, unsigned char *key, size_t keylen, void **old);
 void raxQuartFree(raxQuart *rq);
 uint64_t raxQuartSize(raxQuart *rq);
 

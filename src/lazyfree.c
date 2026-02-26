@@ -145,7 +145,7 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
 
         /* Make a best effort estimate to maintain constant runtime. Every macro
          * node in the Stream is one allocation. */
-        effort += s->rax->numnodes;
+        effort += s->tree.rax->numnodes;
 
         /* Every consumer group is an allocation and so are the entries in its
          * PEL. We use size of the first group's PEL as an estimate for all

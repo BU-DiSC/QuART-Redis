@@ -1203,7 +1203,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
     } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
         stream *s = o->ptr;
-        rax *rax = s->rax;
+        rax *rax = s->tree.rax;
         if ((n = rdbSaveLen(rdb,raxSize(rax))) == -1) return -1;
         nwritten += n;
 
@@ -3108,7 +3108,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
 
             /* Insert the key in the radix tree. */
-            int retval = raxTryInsert(s->rax,
+            int retval = raxTryInsert(s->tree.rax,
                 (unsigned char*)nodekey,sizeof(streamID),lp,NULL);
             sdsfree(nodekey);
             if (!retval) {
@@ -3156,7 +3156,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             return NULL;
         }
 
-        if (s->length && !raxSize(s->rax)) {
+        if (s->length && !raxSize(s->tree.rax)) {
             rdbReportCorruptRDB("Stream length inconsistent with rax entries");
             decrRefCount(o);
             return NULL;

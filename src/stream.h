@@ -33,8 +33,15 @@ typedef struct idmpProducer {
 /* Dictionary type for IDMP entries - uses IID as key */
 extern dictType idmpDictType;
 
+/* Returns the underlying rax* for either a rax or raxQuart stream. */
+#define streamRax(s) ((s)->use_quart ? ((s)->tree.quart->rax) : (s)->tree.rax)
+
 typedef struct stream {
-    rax *rax;               /* The radix tree holding the stream. */
+    int use_quart;          /* Flag: 0=rax, 1=raxQuart */
+    union {
+        rax *rax;           /* The radix tree holding the stream. */
+        struct raxQuart *quart; /* The QuART-optimized radix tree. */
+    } tree;
     uint64_t length;        /* Current number of elements inside this stream. */
     streamID last_id;       /* Zero if there are yet no items. */
     streamID first_id;      /* The first non-tombstone entry, zero if empty. */
