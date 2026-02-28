@@ -1,43 +1,25 @@
 #!/bin/bash
-# Airport Operations Redis Benchmark
+# Redis Stream Workload Benchmark
 #
-# Simulates a real-time airport departure management system backed by Redis
-# streams and measures the performance difference between vanilla rax and
-# QuART (rax_quart) as Redis's internal stream index.
+# Measures XADD (insert) and XRANGE (query) performance for vanilla rax vs
+# QuART (rax_quart) as Redis's internal stream index, across bods workloads
+# with varying sortedness (K).  Each uint32 value is used as both stream ID
+# and field value.
 #
-# Each gate at the airport has a dedicated Redis stream (gate:A01, gate:B14 …)
-# populated with that gate's flight schedule via XADD, ordered by departure epoch.
-# Gate agents and departure boards query their gate streams via XRANGE.
+#   RAX   – redis-server started with stream-quart-enabled no  (default)
+#   QuART – same redis-server binary, started with stream-quart-enabled yes
 #
-#   RAX   – standard Redis build (vanilla rax stream index)
-#   QuART – Redis built with USE_QUART=yes (rax_quart fast-path index)
-#
-# Workload sortedness (K,L) maps directly to airport operating conditions:
-#
-#   K=0   Perfectly on-time airline: all flights loaded in strict departure
-#         order across the day.  QuART’s fast-path fires on every XADD,
-#         giving maximum speedup.
-#
-#   K=1   Near-perfect schedule: rare last-minute gate re-assignments.
-#
-#   K=5   Realistic ops: occasional equipment swaps and late check-ins
-#         cause minor schedule disorder.
-#
-#   K=10  Moderate disruptions: weather holds, maintenance delays.
-#
-#   K=25  Busy hub: 25% of flights see gate changes or sequence breaks.
-#
-#   K=100 Chaos day: ATC ground stop, strikes, mass re-routings — no
-#         ordering benefit.  QuART offers no advantage over vanilla rax.
+#   K=0   fully sorted   → one sub-stream, every XADD hits QuART fast-path
+#   K=100 fully random   → many sub-streams, no fast-path benefit
 #
 # Usage:
 #   ./test_redis_workloads.sh [--rax-bin /path/redis-server]
-#                             [--quart-bin /path/redis-server-quart]
+#                             [--quart-bin /path/redis-server]  # same binary
 #                             [--skip-rax] [--skip-quart]
-#                             [--port PORT] [--N num_flights]
+#                             [--port PORT] [--N num_keys]
+#                             [--xrange-count N]
 #
-# Results: results/airport_redis_test_<timestamp>.csv
-
+# Results: results/redis_stream_test_<timestamp>.csv
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,15 +28,17 @@ cd "$SCRIPT_DIR"
 # ── default paths ──────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_RAX_BIN="$REPO_ROOT/src/redis-server"
-DEFAULT_QUART_BIN="$REPO_ROOT/src/redis-server-quart"
+DEFAULT_QUART_BIN="$REPO_ROOT/src/redis-server"  # same binary; QuART is a runtime config flag
 TEST_PROG="$REPO_ROOT/src/test-redis-stream-workloads"
 WORKLOAD_DIR="/home/grad1/cgokmen/bods/workloads/"  # same workloads as standalone test
 
 # ── configuration ─────────────────────────────────────────────────────────
 REDIS_PORT=7379
-N=500000000
+N=1000000          # number of keys to actually insert/query (first N from file)
+WORKLOAD_N=500000000  # N embedded in the workload filenames
 REPEAT=3
-KL_VALUES=(0 1 5 10 25 100)
+KL_VALUES=(0)
+XRANGE_COUNT=1000   # max entries per XRANGE reply (caps reply size for sorted workloads)
 RESULTSDIR="results"
 LOGDIR="$RESULTSDIR/logs"
 
@@ -70,14 +54,16 @@ while [[ $# -gt 0 ]]; do
         --quart-bin) QUART_BIN="$2"; shift 2 ;;
         --skip-rax)   SKIP_RAX=1;    shift   ;;
         --skip-quart) SKIP_QUART=1;  shift   ;;
-        --port)      REDIS_PORT="$2"; shift 2 ;;
-        --N)         N="$2";         shift 2 ;;
+        --port)        REDIS_PORT="$2";   shift 2 ;;
+        --N)           N="$2";             shift 2 ;;
+        --workload-n)  WORKLOAD_N="$2";    shift 2 ;;
+        --xrange-count) XRANGE_COUNT="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 SUFFIX=$(date +"%Y%m%d_%H%M%S")
-RESULTS="${RESULTSDIR}/airport_redis_test_${SUFFIX}.csv"
+RESULTS="${RESULTSDIR}/redis_stream_test_${SUFFIX}.csv"
 mkdir -p "$LOGDIR"
 
 # ── sanity checks ──────────────────────────────────────────────────────────
@@ -99,9 +85,7 @@ if [[ $SKIP_RAX -eq 0 && ! -f "$RAX_BIN" ]]; then
 fi
 
 if [[ $SKIP_QUART -eq 0 && ! -f "$QUART_BIN" ]]; then
-    echo "WARNING: QuART server binary not found at $QUART_BIN"
-    echo "         Build one with:  cd src && make USE_QUART=yes"
-    echo "         Then re-run with --quart-bin $QUART_BIN"
+    echo "WARNING: Redis server binary not found at $QUART_BIN — skipping QuART"
     SKIP_QUART=1
 fi
 
@@ -117,6 +101,7 @@ REDIS_PIDFILE="/tmp/redis_test_${REDIS_PORT}.pid"
 
 start_redis() {
     local binary="$1"
+    local use_quart="${2:-no}"
     local conf="${LOGDIR}/redis_${SUFFIX}.conf"
 
     # Kill anything still on the port before starting
@@ -134,6 +119,7 @@ logfile ${LOGDIR}/redis_${SUFFIX}.log
 pidfile $REDIS_PIDFILE
 save ""
 appendonly no
+stream-quart-enabled $use_quart
 EOF
 
     "$binary" "$conf"
@@ -168,84 +154,68 @@ stop_redis() {
     rm -f "$REDIS_PIDFILE"
 }
 
-run_workload_tests() {
+# Run a single trial: one Redis start/stop for the given binary, label, K, and run number.
+run_one_trial() {
     local binary="$1"
     local label="$2"
+    local KL="$3"
+    local run="$4"
+    local K=$KL
+    local L=$KL
+    local WORKLOAD="${WORKLOAD_DIR}/workload_N${WORKLOAD_N}_K${K}_L${L}.bin"
+    local LOGFILE="${LOGDIR}/log_${label}_K${K}_L${L}_${SUFFIX}.txt"
 
-    echo ""
-    echo "=========================================================="
-    echo "Testing: $label  ($(basename "$binary"))"
-    echo "=========================================================="
+    printf "    [%s] Run %d/%d: " "$label" "$run" "$REPEAT"
 
-    for KL in "${KL_VALUES[@]}"; do
-        local K=$KL
-        local L=$KL
-        local WORKLOAD="${WORKLOAD_DIR}/workload_N${N}_K${K}_L${L}.bin"
+    # Start a fresh Redis instance for each trial to avoid state carry-over
+    # Pass stream-quart-enabled yes for QuART runs, no for RAX runs
+    local use_quart="no"
+    [[ "$label" == "QuART" ]] && use_quart="yes"
+    start_redis "$binary" "$use_quart" || { echo "FAIL (server start)"; return; }
 
-        if [[ ! -f "$WORKLOAD" ]]; then
-            echo "  WARNING: workload not found: $WORKLOAD — skipping K=$K L=$L"
-            continue
-        fi
+    # stdout → tee to terminal + tmpfile (CSV parsing later)
+    # stderr → appended to logfile (errors/warnings)
+    local TMPOUT
+    TMPOUT=$(mktemp)
+    echo "" # newline before verbose block
+    {
+        echo "=== $label K=$K L=$L Run $run/$REPEAT — $(date) ==="
+    } >> "$LOGFILE"
 
-        # Describe the operating condition in airport terms
-        case "$KL" in
-            0)   CONDITION="Perfectly on-time airline (K=0)" ;;
-            1)   CONDITION="Near-perfect schedule, rare re-assignments (K=1)" ;;
-            5)   CONDITION="Realistic ops: occasional equipment swaps (K=5)" ;;
-            10)  CONDITION="Moderate disruptions: weather/maintenance (K=10)" ;;
-            25)  CONDITION="Busy hub: frequent gate changes (K=25)" ;;
-            100) CONDITION="Chaos day: ATC ground stop, mass re-routings (K=100)" ;;
-            *)   CONDITION="K=$KL" ;;
-        esac
+    "$TEST_PROG" \
+        -f "$WORKLOAD" \
+        -N "$N" \
+        -h 127.0.0.1 \
+        -p "$REDIS_PORT" \
+        -n "$label" \
+        -C "$XRANGE_COUNT" \
+        -v \
+        2>>"$LOGFILE" | tee "$TMPOUT" || true
 
-        echo "  Scenario: $CONDITION"
-        echo "  Workload: $(basename "$WORKLOAD")"
-        local LOGFILE="${LOGDIR}/log_${label}_K${K}_L${L}_${SUFFIX}.txt"
+    stop_redis
 
-        for ((run=1; run<=REPEAT; run++)); do
-            printf "    Run %d/%d: " "$run" "$REPEAT"
+    local OUTPUT
+    OUTPUT=$(cat "$TMPOUT")
+    rm -f "$TMPOUT"
 
-            # Start a fresh Redis instance for each run to avoid state
-            start_redis "$binary" || { echo "FAIL (server start)"; continue; }
+    # Append captured stdout to log
+    { echo "$OUTPUT"; echo ""; } >> "$LOGFILE"
 
-            local OUTPUT
-            OUTPUT=$("$TEST_PROG" \
-                -f "$WORKLOAD" \
-                -N "$N" \
-                -h 127.0.0.1 \
-                -p "$REDIS_PORT" \
-                -n "$label" 2>&1) || true
+    # Extract CSV line
+    local LINE
+    LINE=$(echo "$OUTPUT" | grep "^${label},")
 
-            stop_redis
+    if [[ -z "$LINE" ]]; then
+        echo "FAIL (no CSV output)"
+        return
+    fi
 
-            # Log everything
-            {
-                echo "=== $label K=$K L=$L Run $run/$REPEAT — $(date) ==="
-                echo "=== Scenario: $CONDITION ==="
-                echo "$OUTPUT"
-                echo ""
-            } >> "$LOGFILE"
+    local INSERT_NS QUERY_NS
+    INSERT_NS=$(echo "$LINE" | cut -d',' -f2)
+    QUERY_NS=$(echo "$LINE"  | cut -d',' -f3)
 
-            # Extract CSV line (skip the header line)
-            local LINE
-            LINE=$(echo "$OUTPUT" | grep "^${label},")
-
-            if [[ -z "$LINE" ]]; then
-                echo "FAIL (no CSV output)"
-                echo "--- raw output ---" >> "$LOGFILE"
-                echo "$OUTPUT" >> "$LOGFILE"
-                continue
-            fi
-
-            local INSERT_NS QUERY_NS
-            INSERT_NS=$(echo "$LINE" | cut -d',' -f2)
-            QUERY_NS=$(echo "$LINE"  | cut -d',' -f3)
-
-            echo "$N,$K,$L,$label,$run,$INSERT_NS,$QUERY_NS" >> "$RESULTS"
-            echo "OK  (schedule_load=${INSERT_NS}ns  board_query=${QUERY_NS}ns)"
-        done
-        echo ""
-    done
+    echo "$N,$K,$L,$label,$run,$INSERT_NS,$QUERY_NS" >> "$RESULTS"
+    echo "OK  (insert=${INSERT_NS}ns  query=${QUERY_NS}ns)"
 }
 
 # ── CSV header ─────────────────────────────────────────────────────────────
@@ -253,24 +223,34 @@ echo "N,K,L,tree_type,run,insert_ns,query_ns" > "$RESULTS"
 
 # ── banner ─────────────────────────────────────────────────────────────────
 echo "=========================================================="
-echo "Airport Operations Redis Benchmark"
+echo "Redis Stream Workload Benchmark"
 echo "=========================================================="
-echo "Simulating N=$N flight events  |  REPEAT=$REPEAT  |  PORT=$REDIS_PORT"
+echo "N=$N keys (first $N of $WORKLOAD_N)  |  REPEAT=$REPEAT  |  PORT=$REDIS_PORT  |  XRANGE COUNT=$XRANGE_COUNT"
 echo ""
-echo "Operating conditions tested (K,L):"
-echo "  K=0   Perfectly on-time airline: full-day schedule in departure order"
-echo "  K=1   Near-perfect: rare last-minute gate re-assignments"
-echo "  K=5   Realistic ops: occasional equipment swaps and late check-ins"
-echo "  K=10  Moderate disruptions: weather holds, maintenance delays"
-echo "  K=25  Busy hub: frequent gate changes and sequence breaks"
-echo "  K=100 Chaos day: ATC ground stop, mass re-routings"
+echo "Workloads (K,L):"
+echo "  K=0   fully sorted   -> one sub-stream, QuART fast-path on every XADD"
+echo "  K=1   K=5   K=10   K=25   increasing disorder"
+echo "  K=100 fully random  -> many sub-streams, no fast-path benefit"
 echo ""
 echo "Results: $RESULTS"
 echo "=========================================================="
 
-# ── run tests ──────────────────────────────────────────────────────────────
-[[ $SKIP_RAX   -eq 0 ]] && run_workload_tests "$RAX_BIN"   "RAX"
-[[ $SKIP_QUART -eq 0 ]] && run_workload_tests "$QUART_BIN" "QuART"
+# ── run tests (interleaved: RAX run N then QuART run N per workload) ───────
+for KL in "${KL_VALUES[@]}"; do
+    K=$KL; L=$KL
+    WORKLOAD="${WORKLOAD_DIR}/workload_N${WORKLOAD_N}_K${K}_L${L}.bin"
+    if [[ ! -f "$WORKLOAD" ]]; then
+        echo "  WARNING: workload not found: $WORKLOAD — skipping K=$K"
+        continue
+    fi
+    echo ""
+    echo "  K=$KL  workload: $(basename "$WORKLOAD")"
+    for ((run=1; run<=REPEAT; run++)); do
+        [[ $SKIP_RAX   -eq 0 ]] && run_one_trial "$RAX_BIN"   "RAX"   "$KL" "$run"
+        [[ $SKIP_QUART -eq 0 ]] && run_one_trial "$QUART_BIN" "QuART" "$KL" "$run"
+    done
+    echo ""
+done
 
 echo "=========================================================="
 echo "Done!  Results: $RESULTS"
@@ -279,25 +259,25 @@ echo "=========================================================="
 # ── summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "Generating summary..."
-SUMMARY="${RESULTSDIR}/airport_redis_summary_${SUFFIX}.txt"
+SUMMARY="${RESULTSDIR}/redis_stream_summary_${SUFFIX}.txt"
 
 {
-    echo "Airport Operations Redis Benchmark Summary"
+    echo "Redis Stream Workload Benchmark Summary"
     echo "Generated: $(date)"
-    echo "N=$N flights simulated  |  REPEAT=$REPEAT  |  PORT=$REDIS_PORT"
-    echo "Streams: gate:{A-E}{01-30} — INSERT=XADD, QUERY=XRANGE (departure board)"
+    echo "N=$N keys (first $N of $WORKLOAD_N)  |  REPEAT=$REPEAT  |  PORT=$REDIS_PORT"
+    echo "INSERT=XADD stream:<idx> <k>-<seq> v <k>  |  QUERY=XRANGE COUNT $XRANGE_COUNT"
     echo "========================================================"
-    printf "%-8s | %-10s | %15s | %15s | Condition\n" "K,L" "Tree" "SchedLoad(ns)" "BoardQry(ns)"
-    printf '%0.s-' {1..80}; echo ""
+    printf "%-8s | %-10s | %15s | %15s\n" "K,L" "Tree" "insert_ns(avg)" "query_ns(avg)"
+    printf '%0.s-' {1..60}; echo ""
 
     for KL in "${KL_VALUES[@]}"; do
         case "$KL" in
-            0)   COND="On-time (K=0)" ;;
-            1)   COND="Near-perfect (K=1)" ;;
-            5)   COND="Realistic ops (K=5)" ;;
-            10)  COND="Moderate disruptions (K=10)" ;;
-            25)  COND="Busy hub (K=25)" ;;
-            100) COND="Chaos day (K=100)" ;;
+            0)   COND="K=0 (fully sorted)" ;;
+            1)   COND="K=1" ;;
+            5)   COND="K=5" ;;
+            10)  COND="K=10" ;;
+            25)  COND="K=25" ;;
+            100) COND="K=100 (fully random)" ;;
             *)   COND="K=$KL" ;;
         esac
 
@@ -312,8 +292,8 @@ SUMMARY="${RESULTSDIR}/airport_redis_summary_${SUFFIX}.txt"
             [[ -z "$AVG_INS" ]] && AVG_INS="N/A"
             [[ -z "$AVG_QRY" ]] && AVG_QRY="N/A"
 
-            printf "%-8s | %-10s | %15s | %15s | %s\n" \
-                "$KL,$KL" "$LABEL" "$AVG_INS" "$AVG_QRY" "$COND"
+            printf "%-8s | %-10s | %15s | %15s\n" \
+                "$KL,$KL" "$LABEL" "$AVG_INS" "$AVG_QRY"
         done
 
         # Speedup (QuART vs RAX)
@@ -329,7 +309,7 @@ SUMMARY="${RESULTSDIR}/airport_redis_summary_${SUFFIX}.txt"
             printf "%-8s | %-10s | %15s |\n" "" "Speedup" "$SPD"
         fi
 
-        printf '%0.s-' {1..80}; echo ""
+        printf '%0.s-' {1..60}; echo ""
     done
 } > "$SUMMARY"
 
