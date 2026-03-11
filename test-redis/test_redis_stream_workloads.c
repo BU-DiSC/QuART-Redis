@@ -31,9 +31,8 @@
 
 #include "../deps/hiredis/hiredis.h"
 
-/* Size of the file read buffer (uint32 values).  Only governs I/O chunk
- * size; every Redis command is issued as an individual synchronous call. */
-#define READ_CHUNK 8192
+/* Number of XRANGE commands to pipeline before draining replies. */
+#define PIPELINE_DEPTH 1024
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -42,9 +41,6 @@ static long long get_time_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
 }
-
-/* No bulk read_workload — keys are streamed in READ_CHUNK-sized chunks
- * so memory usage stays at ~32 KB regardless of N. */
 
 /* Delete all sub-streams created during the test. */
 static void cleanup_streams(redisContext *ctx, size_t num_streams, int verbose) {
@@ -63,80 +59,50 @@ static void cleanup_streams(redisContext *ctx, size_t num_streams, int verbose) 
 
 /* ── INSERT ───────────────────────────────────────────────────────────────── */
 /*
- * Streams the binary workload file in READ_CHUNK-sized chunks.
- * Each uint32 value becomes both the stream entry ID and the single
- * field value:  XADD stream:<idx> <k>-<dup_seq> v <k>
- *
- * Commands are issued one at a time (synchronous round-trip), matching
- * the standalone raxInsert-per-key pattern.
+ * Issues a single DEBUG STREAM-BULK-INSERT command.  The server reads the
+ * workload file itself, calls streamAppendItem for all N keys in one tight
+ * loop, and returns [num_streams, insert_ns, errors].  There is zero
+ * client-server overhead inside the measured window, so the timing reflects
+ * pure rax/QuART index insertion — making the RAX vs QuART difference
+ * directly visible.
  */
 static long long run_insert(redisContext *ctx, const char *filename,
                             size_t num_keys, int verbose, size_t *out_streams) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        fprintf(stderr, "Error: cannot open workload file %s\n", filename);
+    if (verbose)
+        printf("  Inserting %zu keys via DEBUG STREAM-BULK-INSERT...\n", num_keys);
+
+    redisReply *r = redisCommand(ctx, "DEBUG STREAM-BULK-INSERT %s %llu",
+                                 filename, (unsigned long long)num_keys);
+    if (!r) {
+        fprintf(stderr, "Error: no reply from DEBUG STREAM-BULK-INSERT\n");
+        return -1;
+    }
+    if (r->type == REDIS_REPLY_ERROR) {
+        fprintf(stderr, "Error from server: %s\n", r->str);
+        freeReplyObject(r);
+        return -1;
+    }
+    if (r->type != REDIS_REPLY_ARRAY || r->elements < 3) {
+        fprintf(stderr, "Error: unexpected reply type %d\n", r->type);
+        freeReplyObject(r);
         return -1;
     }
 
-    /* Read buffer — keeps resident memory at ~32 KB regardless of N */
-    uint32_t buf[READ_CHUNK];
-    size_t stream_idx = 0;
-    uint32_t last_key = 0;
-    int has_last = 0;
-    uint32_t dup_seq = 0;
-
-    size_t errors = 0;
-    size_t processed = 0;
-
-    if (verbose)
-        printf("  Inserting %zu keys...\n", num_keys);
-
-    long long start = get_time_ns();
-
-    while (processed < num_keys) {
-        size_t want = num_keys - processed;
-        if (want > READ_CHUNK) want = READ_CHUNK;
-
-        size_t got = fread(buf, sizeof(uint32_t), want, fp);
-        if (got == 0) break;
-
-        for (size_t i = 0; i < got; i++) {
-            uint32_t k = buf[i];
-
-            if (has_last) {
-                if (k < last_key) { stream_idx++; dup_seq = 0; }
-                else if (k == last_key) { dup_seq++; }
-                else { dup_seq = 0; }
-            }
-
-            char skey[24], sid[24], val[12];
-            snprintf(skey, sizeof(skey), "%zu", stream_idx);
-            snprintf(sid,  sizeof(sid),  "%u-%u", k, dup_seq);
-            snprintf(val,  sizeof(val),  "%u", k);
-
-            redisReply *r = redisCommand(ctx, "XADD stream:%s %s v %s", skey, sid, val);
-            if (!r || r->type == REDIS_REPLY_ERROR) errors++;
-            if (r) freeReplyObject(r);
-
-            last_key = k;
-            has_last = 1;
-        }
-        processed += got;
-    }
-
-    long long end = get_time_ns();
-    fclose(fp);
-    *out_streams = stream_idx + 1;
+    *out_streams = (size_t)r->element[0]->integer;
+    long long insert_ns = r->element[1]->integer;
+    long long errors    = r->element[2]->integer;
+    freeReplyObject(r);
 
     if (errors && verbose)
-        fprintf(stderr, "  Warning: %zu XADD errors\n", errors);
+        fprintf(stderr, "  Warning: %lld streamAppendItem errors\n", errors);
 
-    return end - start;
+    return insert_ns;
 }
 
 /* ── QUERY ────────────────────────────────────────────────────────────────── */
 /*
- * Issues XRANGE stream:<idx> - + COUNT <n> for a sampled subset of sub-streams.
+ * Issues XRANGE stream:<idx> - + COUNT <n> for a sampled subset of
+ * sub-streams, pipelined in batches of PIPELINE_DEPTH.
  */
 static long long run_query(redisContext *ctx, size_t num_streams,
                            size_t query_count, size_t xrange_count, int verbose) {
@@ -147,13 +113,14 @@ static long long run_query(redisContext *ctx, size_t num_streams,
     if (stride == 0) stride = 1;
 
     size_t errors = 0;
+    size_t pending = 0;
 
     char cntstr[24];
     snprintf(cntstr, sizeof(cntstr), "%zu", xrange_count);
 
     if (verbose)
-        printf("  Querying %zu streams (XRANGE COUNT %zu)...\n",
-               query_count, xrange_count);
+        printf("  Querying %zu streams (XRANGE COUNT %zu, pipeline depth %d)...\n",
+               query_count, xrange_count, PIPELINE_DEPTH);
 
     long long start = get_time_ns();
 
@@ -162,7 +129,25 @@ static long long run_query(redisContext *ctx, size_t num_streams,
         if (idx >= num_streams) idx = num_streams - 1;
         char skey[24];
         snprintf(skey, sizeof(skey), "%zu", idx);
-        redisReply *r = redisCommand(ctx, "XRANGE stream:%s - + COUNT %s", skey, cntstr);
+
+        redisAppendCommand(ctx, "XRANGE stream:%s - + COUNT %s", skey, cntstr);
+        pending++;
+
+        if (pending >= PIPELINE_DEPTH) {
+            for (size_t j = 0; j < pending; j++) {
+                redisReply *r = NULL;
+                redisGetReply(ctx, (void **)&r);
+                if (!r || r->type == REDIS_REPLY_ERROR) errors++;
+                if (r) freeReplyObject(r);
+            }
+            pending = 0;
+        }
+    }
+
+    /* Drain remaining */
+    for (size_t j = 0; j < pending; j++) {
+        redisReply *r = NULL;
+        redisGetReply(ctx, (void **)&r);
         if (!r || r->type == REDIS_REPLY_ERROR) errors++;
         if (r) freeReplyObject(r);
     }
@@ -189,7 +174,7 @@ static void print_usage(const char *prog) {
     printf("            [-n <name>] [-Q <query_pct>] [-C <xrange_count>] [-v]\n\n");
     printf("Options:\n");
     printf("  -f <file>    Binary workload file (uint32_t array, required)\n");
-    printf("  -N <n>       Number of keys to insert (default: 1000000)\n");
+    printf("  -N <n>       Number of keys to insert (default: 50000000)\n");
     printf("  -h <host>    Redis host (default: 127.0.0.1)\n");
     printf("  -p <port>    Redis port (default: 6379)\n");
     printf("  -a <pass>    Redis AUTH password (optional)\n");
@@ -208,7 +193,7 @@ int main(int argc, char **argv) {
     const char *auth = NULL;
     const char *name = "REDIS";
     char *workload_file = NULL;
-    size_t num_keys = 1000000;
+    size_t num_keys = 50000000;
     int query_pct = 100;
     size_t xrange_count = 1000;
     int verbose = 0;

@@ -518,6 +518,14 @@ void debugCommand(client *c) {
 "    Disable trimming or force active/background trimming for cluster atomic slot migration.",
 "    Active trim delay is used only when method is 'active'. If it is negative,",
 "    active trim is disabled.",
+"STREAM-BULK-INSERT <workload_file> <N>",
+"    Read N uint32_t keys from the binary workload file server-side and insert",
+"    them directly into Redis streams (stream:0, stream:1, ...) via",
+"    streamAppendItem, bypassing all client-server overhead.  Returns an array",
+"    [num_streams, insert_ns, errors].  Streams are left in the DB for querying;",
+"    delete them with DEBUG STREAM-BULK-CLEANUP <num_streams>.",
+"STREAM-BULK-CLEANUP <num_streams>",
+"    Delete the streams created by STREAM-BULK-INSERT.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -1142,13 +1150,130 @@ NULL
         } else {
             addReply(c, shared.ok);
         }
-    } else if(!strcasecmp(c->argv[1]->ptr,"asm-trim-method") && c->argc >= 3) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"asm-trim-method") && c->argc >= 3) {
         int delay = c->argc == 4 ? atoi(c->argv[3]->ptr) : 0;
         if (asmDebugSetTrimMethod(c->argv[2]->ptr, delay) != C_OK) {
             addReplyError(c, "Failed to set ASM trim method");
         } else {
             addReply(c, shared.ok);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"stream-bulk-insert") && c->argc == 4) {
+        /* DEBUG STREAM-BULK-INSERT <workload_file> <N>
+         *
+         * Reads N uint32_t keys from the binary workload file entirely
+         * server-side and inserts them into streams (stream:0, stream:1, ...)
+         * via streamAppendItem, measuring only the insertion time.
+         * This eliminates all client-server overhead from the measurement,
+         * making the RAX vs QuART index difference directly visible.
+         *
+         * Returns array: [num_streams, insert_ns, errors]
+         * Streams are left in the DB for querying.
+         */
+        long long num_keys;
+        if (getLongLongFromObjectOrReply(c, c->argv[3], &num_keys, NULL) != C_OK) return;
+        if (num_keys <= 0) { addReplyError(c, "N must be positive"); return; }
+
+        const char *filename = c->argv[2]->ptr;
+        FILE *fp = fopen(filename, "rb");
+        if (!fp) {
+            addReplyErrorFormat(c, "Cannot open workload file: %s", filename);
+            return;
+        }
+
+#define SBULK_CHUNK 8192
+        uint32_t sbuf[SBULK_CHUNK];
+        size_t stream_idx = 0;
+        uint32_t last_key = 0;
+        int has_last = 0;
+        uint32_t dup_seq = 0;
+        long long processed = 0;
+        long long errors = 0;
+
+        /* Shared field robj "v" reused for every insert */
+        robj *field = createStringObject("v", 1);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while (processed < num_keys) {
+            size_t want = (size_t)(num_keys - processed);
+            if (want > SBULK_CHUNK) want = SBULK_CHUNK;
+            size_t got = fread(sbuf, sizeof(uint32_t), want, fp);
+            if (got == 0) break;
+
+            for (size_t i = 0; i < got; i++) {
+                uint32_t k = sbuf[i];
+
+                if (has_last) {
+                    if (k < last_key)      { stream_idx++; dup_seq = 0; }
+                    else if (k == last_key){ dup_seq++; }
+                    else                   { dup_seq = 0; }
+                }
+
+                /* Lookup or create stream:<idx> */
+                char skey_buf[32];
+                int skey_len = snprintf(skey_buf, sizeof(skey_buf), "stream:%zu", stream_idx);
+                robj *skey = createStringObject(skey_buf, skey_len);
+
+                kvobj *kv = lookupKeyWrite(c->db, skey);
+                if (kv == NULL) {
+                    robj *o = createStreamObject();
+                    kv = dbAdd(c->db, skey, &o);
+                }
+                stream *s = kv->ptr;
+
+                /* Value = string representation of k */
+                char val_buf[12];
+                int val_len = snprintf(val_buf, sizeof(val_buf), "%u", k);
+                robj *val = createStringObject(val_buf, val_len);
+
+                robj *fv[2] = {field, val};
+                streamID use_id = {(uint64_t)k, (uint64_t)dup_seq};
+                streamID added_id;
+
+                if (streamAppendItem(s, fv, 1, &added_id, &use_id, 1) != C_OK)
+                    errors++;
+
+                decrRefCount(val);
+                decrRefCount(skey);
+
+                last_key = k;
+                has_last = 1;
+            }
+            processed += (long long)got;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long insert_ns = ((long long)t1.tv_sec - t0.tv_sec) * 1000000000LL
+                            + (t1.tv_nsec - t0.tv_nsec);
+
+        fclose(fp);
+        decrRefCount(field);
+#undef SBULK_CHUNK
+
+        size_t num_streams = stream_idx + 1;
+        addReplyArrayLen(c, 3);
+        addReplyLongLong(c, (long long)num_streams);
+        addReplyLongLong(c, insert_ns);
+        addReplyLongLong(c, errors);
+
+    } else if (!strcasecmp(c->argv[1]->ptr,"stream-bulk-cleanup") && c->argc == 3) {
+        /* DEBUG STREAM-BULK-CLEANUP <num_streams>
+         * Delete all stream:<idx> keys created by STREAM-BULK-INSERT.
+         */
+        long long num_streams;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &num_streams, NULL) != C_OK) return;
+
+        long long deleted = 0;
+        for (long long i = 0; i < num_streams; i++) {
+            char skey_buf[32];
+            int skey_len = snprintf(skey_buf, sizeof(skey_buf), "stream:%lld", i);
+            robj *skey = createStringObject(skey_buf, skey_len);
+            if (dbDelete(c->db, skey)) deleted++;
+            decrRefCount(skey);
+        }
+        addReplyLongLong(c, deleted);
+
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;

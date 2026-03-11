@@ -34,7 +34,7 @@ WORKLOAD_DIR="/home/grad1/cgokmen/bods/workloads/"  # same workloads as standalo
 
 # ── configuration ─────────────────────────────────────────────────────────
 REDIS_PORT=7379
-N=1000000          # number of keys to actually insert/query (first N from file)
+N=50000000         # number of keys to actually insert/query (first N from file)
 WORKLOAD_N=500000000  # N embedded in the workload filenames
 REPEAT=3
 KL_VALUES=(0)
@@ -117,9 +117,34 @@ port $REDIS_PORT
 daemonize yes
 logfile ${LOGDIR}/redis_${SUFFIX}.log
 pidfile $REDIS_PIDFILE
+
+# ── Persistence completely OFF – insert performance must be the sole bottleneck ──
+
+# Snapshotting / RDB off: no periodic saves, no fork, no copy-on-write shadow paging
 save ""
+rdbchecksum no
+rdbcompression no
+stop-writes-on-bgsave-error no
+
+# Shadow paging off: BGSAVE forks a child that uses CoW to write a shadow copy of
+# the dataset.  With save "" there is no automatic trigger, but we also explicitly
+# prevent any BGSAVE error from stalling writes.
+# (RDB settings above ensure even an accidental BGSAVE is as cheap as possible.)
+
+# AOF (append-only-file) logging off: no per-command disk writes, no fsync calls
 appendonly no
+aof-use-rdb-preamble no
+no-appendfsync-on-rewrite yes
+
+# ── Stream index selection ────────────────────────────────────────────────────
 stream-quart-enabled $use_quart
+# Force every XADD to create its own rax node so that rax/QuART
+# insertions dominate runtime rather than listpack encoding overhead.
+stream-node-max-entries 1
+stream-node-max-bytes 1
+
+# Allow DEBUG commands (needed for DEBUG STREAM-BULK-INSERT)
+enable-debug-command yes
 EOF
 
     "$binary" "$conf"
