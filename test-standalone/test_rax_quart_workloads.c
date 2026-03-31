@@ -102,9 +102,7 @@ void test_rax(uint32_t *keys, size_t num_keys, size_t query_count, int verbose,
 
 /* Test rax_quart */
 void test_rax_quart(uint32_t *keys, size_t num_keys, size_t query_count, int verbose,
-                    long long *insert_time, long long *query_time,
-                    uint64_t *fp_inserts, uint64_t *regular_inserts,
-                    uint64_t *bridges, uint64_t *resets) {
+                    long long *insert_time, long long *query_time) {
     raxQuart *rq = raxQuartNew();
     unsigned char key_bytes[4];
     
@@ -120,15 +118,9 @@ void test_rax_quart(uint32_t *keys, size_t num_keys, size_t query_count, int ver
     long long end = get_time_ns();
     *insert_time = end - start;
     
-    // Get statistics
-    raxQuartGetStats(rq, fp_inserts, regular_inserts, bridges, resets);
-    
     if (verbose) {
         printf("  QuART: Inserted %zu keys in %lld ns (%.2f ns/key)\n",
                num_keys, *insert_time, (double)*insert_time / num_keys);
-        printf("  QuART Stats: FP=%llu, Regular=%llu, Bridges=%llu, Resets=%llu\n",
-               (unsigned long long)*fp_inserts, (unsigned long long)*regular_inserts,
-               (unsigned long long)*bridges, (unsigned long long)*resets);
     }
     
     // Query test
@@ -234,9 +226,7 @@ int main(int argc, char **argv) {
     // Test RAX_QUART
     if (verbose) printf("\nTesting RAX_QUART...\n");
     long long quart_insert_time, quart_query_time;
-    uint64_t fp_inserts, regular_inserts, bridges, resets;
-    test_rax_quart(keys, num_keys, query_count, verbose, &quart_insert_time, &quart_query_time,
-                   &fp_inserts, &regular_inserts, &bridges, &resets);
+    test_rax_quart(keys, num_keys, query_count, verbose, &quart_insert_time, &quart_query_time);
     
     // Print results
     if (verbose) {
