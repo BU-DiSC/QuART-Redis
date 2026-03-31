@@ -34,7 +34,7 @@ WORKLOAD_DIR="/home/grad1/cgokmen/bods/workloads/"  # same workloads as standalo
 
 # ── configuration ─────────────────────────────────────────────────────────
 REDIS_PORT=7379
-N=50000000         # number of keys to actually insert/query (first N from file)
+N=500000000         # number of keys to actually insert/query (first N from file)
 WORKLOAD_N=500000000  # N embedded in the workload filenames
 REPEAT=3
 KL_VALUES=(0)
