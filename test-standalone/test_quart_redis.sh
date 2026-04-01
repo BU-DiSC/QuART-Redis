@@ -55,8 +55,8 @@ fi
 echo "Found ${#WORKLOAD_FILES[@]} workload files."
 echo ""
 
-# CSV header
-echo "N,K,L,tree_type,run,insert_ns,query_ns" > "$RESULTS"
+# CSV header (averages only — no per-run column)
+echo "N,K,L,tree_type,insert_ns,query_ns" > "$RESULTS"
 
 # Run tests over every workload file
 for WORKLOAD in "${WORKLOAD_FILES[@]}"; do
@@ -75,6 +75,10 @@ for WORKLOAD in "${WORKLOAD_FILES[@]}"; do
     echo "Testing K=$K, L=$L (file: $BASENAME)"
 
     LOGFILE="${LOGDIR}/log_K${K}_L${L}_${SUFFIX}.txt"
+
+    # Accumulators for averaging across runs
+    RAX_INSERT_SUM=0; RAX_QUERY_SUM=0; RAX_COUNT=0
+    QUART_INSERT_SUM=0; QUART_QUERY_SUM=0; QUART_COUNT=0
 
     for ((i=1; i<=REPEAT; i++)); do
         echo -n "  Run $i/$REPEAT: "
@@ -96,25 +100,41 @@ for WORKLOAD in "${WORKLOAD_FILES[@]}"; do
             continue
         fi
 
-        # Parse and save RAX results
+        # Accumulate RAX results
         RAX_LINE=$(echo "$CSV_DATA" | grep "^RAX,")
         if [ -n "$RAX_LINE" ]; then
             INSERT_NS=$(echo "$RAX_LINE" | cut -d',' -f2)
             QUERY_NS=$(echo "$RAX_LINE" | cut -d',' -f3)
-            echo "$N,$K,$L,RAX,$i,$INSERT_NS,$QUERY_NS" >> "$RESULTS"
+            RAX_INSERT_SUM=$((RAX_INSERT_SUM + INSERT_NS))
+            RAX_QUERY_SUM=$((RAX_QUERY_SUM + QUERY_NS))
+            RAX_COUNT=$((RAX_COUNT + 1))
         fi
 
-        # Parse and save QuART results
+        # Accumulate QuART results
         QUART_LINE=$(echo "$CSV_DATA" | grep "^QuART,")
         if [ -n "$QUART_LINE" ]; then
             INSERT_NS=$(echo "$QUART_LINE" | cut -d',' -f2)
             QUERY_NS=$(echo "$QUART_LINE" | cut -d',' -f3)
-            echo "$N,$K,$L,QuART,$i,$INSERT_NS,$QUERY_NS" >> "$RESULTS"
+            QUART_INSERT_SUM=$((QUART_INSERT_SUM + INSERT_NS))
+            QUART_QUERY_SUM=$((QUART_QUERY_SUM + QUERY_NS))
+            QUART_COUNT=$((QUART_COUNT + 1))
             echo "OK"
         else
             echo "FAIL"
         fi
     done
+
+    # Write a single averaged row per tree to the CSV
+    if [ "$RAX_COUNT" -gt 0 ]; then
+        AVG_INSERT=$((RAX_INSERT_SUM / RAX_COUNT))
+        AVG_QUERY=$((RAX_QUERY_SUM / RAX_COUNT))
+        echo "$N,$K,$L,RAX,$AVG_INSERT,$AVG_QUERY" >> "$RESULTS"
+    fi
+    if [ "$QUART_COUNT" -gt 0 ]; then
+        AVG_INSERT=$((QUART_INSERT_SUM / QUART_COUNT))
+        AVG_QUERY=$((QUART_QUERY_SUM / QUART_COUNT))
+        echo "$N,$K,$L,QuART,$AVG_INSERT,$AVG_QUERY" >> "$RESULTS"
+    fi
 
     echo ""
 done
@@ -140,21 +160,17 @@ printf "%.0s-" {1..60} >> "$SUMMARY"
 echo "" >> "$SUMMARY"
 
 # Collect unique K,L pairs from results
-while IFS=',' read -r rN rK rL rTree rRun rInsert rQuery; do
+while IFS=',' read -r rN rK rL rTree rInsert rQuery; do
     echo "$rK,$rL"
 done < <(tail -n +2 "$RESULTS") | sort -t',' -k1,1n -k2,2n -u | while IFS=',' read -r K L; do
-    RAX_INSERT=$(grep "^$N,$K,$L,RAX," "$RESULTS" | cut -d',' -f6 | \
-        awk '{sum+=$1; count++} END {if(count>0) printf "%.0f", sum/count; else print "N/A"}')
-    RAX_QUERY=$(grep "^$N,$K,$L,RAX," "$RESULTS" | cut -d',' -f7 | \
-        awk '{sum+=$1; count++} END {if(count>0) printf "%.0f", sum/count; else print "N/A"}')
+    RAX_INSERT=$(grep "^$N,$K,$L,RAX," "$RESULTS" | cut -d',' -f5)
+    RAX_QUERY=$(grep  "^$N,$K,$L,RAX," "$RESULTS" | cut -d',' -f6)
 
-    QUART_INSERT=$(grep "^$N,$K,$L,QuART," "$RESULTS" | cut -d',' -f6 | \
-        awk '{sum+=$1; count++} END {if(count>0) printf "%.0f", sum/count; else print "N/A"}')
-    QUART_QUERY=$(grep "^$N,$K,$L,QuART," "$RESULTS" | cut -d',' -f7 | \
-        awk '{sum+=$1; count++} END {if(count>0) printf "%.0f", sum/count; else print "N/A"}')
+    QUART_INSERT=$(grep "^$N,$K,$L,QuART," "$RESULTS" | cut -d',' -f5)
+    QUART_QUERY=$(grep  "^$N,$K,$L,QuART," "$RESULTS" | cut -d',' -f6)
 
-    printf "%-10s | %-10s | %15s | %15s\n" "$K,$L" "RAX" "$RAX_INSERT" "$RAX_QUERY" >> "$SUMMARY"
-    printf "%-10s | %-10s | %15s | %15s\n" "" "QuART" "$QUART_INSERT" "$QUART_QUERY" >> "$SUMMARY"
+    printf "%-10s | %-10s | %15s | %15s\n" "$K,$L" "RAX"   "${RAX_INSERT:-N/A}"   "${RAX_QUERY:-N/A}"   >> "$SUMMARY"
+    printf "%-10s | %-10s | %15s | %15s\n" ""      "QuART" "${QUART_INSERT:-N/A}" "${QUART_QUERY:-N/A}" >> "$SUMMARY"
     printf "%.0s-" {1..60} >> "$SUMMARY"
     echo "" >> "$SUMMARY"
 done

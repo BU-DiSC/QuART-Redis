@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <limits.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include "../src/rax.h"
 #include "../src/rax_quart.h"
 #include "../src/zmalloc.h"
@@ -212,22 +214,73 @@ int main(int argc, char **argv) {
     }
     if (query_count == 0) query_count = 1;
     
-    // Read workload
+    // Read workload once in the parent; children inherit it via fork() copy-on-write.
     uint32_t *keys = read_workload(workload_file, num_keys);
     if (!keys) {
         return 1;
     }
-    
-    // Test RAX
-    if (verbose) printf("Testing standard RAX...\n");
-    long long rax_insert_time, rax_query_time;
-    test_rax(keys, num_keys, query_count, verbose, &rax_insert_time, &rax_query_time);
-    
-    // Test RAX_QUART
-    if (verbose) printf("\nTesting RAX_QUART...\n");
-    long long quart_insert_time, quart_query_time;
-    test_rax_quart(keys, num_keys, query_count, verbose, &quart_insert_time, &quart_query_time);
-    
+
+    long long rax_insert_time = 0, rax_query_time = 0;
+    long long quart_insert_time = 0, quart_query_time = 0;
+
+    /* Each tree runs in its own child process so that:
+     *  - jemalloc starts from an identical baseline for both trees
+     *    (only the read-only keys[] array has been allocated)
+     *  - the insertion phase of one tree cannot pollute the CPU caches
+     *    seen during the query phase of the other tree
+     * The two children run sequentially (fork → wait) to avoid CPU contention.
+     * Results are returned to the parent through a pipe.
+     */
+
+    /* ── RAX child ──────────────────────────────────────────────────── */
+    int pfd[2];
+    if (pipe(pfd) != 0) { perror("pipe"); return 1; }
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        long long ins, qry;
+        if (verbose) printf("Testing standard RAX...\n");
+        test_rax(keys, num_keys, query_count, verbose, &ins, &qry);
+        write(pfd[1], &ins, sizeof(ins));
+        write(pfd[1], &qry, sizeof(qry));
+        close(pfd[1]);
+        zfree(keys);
+        exit(0);
+    }
+    close(pfd[1]);
+    if (read(pfd[0], &rax_insert_time, sizeof(rax_insert_time)) != (ssize_t)sizeof(rax_insert_time) ||
+        read(pfd[0], &rax_query_time,  sizeof(rax_query_time))  != (ssize_t)sizeof(rax_query_time)) {
+        fprintf(stderr, "Error: failed to read RAX results from child\n");
+        return 1;
+    }
+    close(pfd[0]);
+    waitpid(pid, NULL, 0);
+
+    /* ── QuART child ─────────────────────────────────────────────────── */
+    if (pipe(pfd) != 0) { perror("pipe"); return 1; }
+    pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        long long ins, qry;
+        if (verbose) printf("\nTesting RAX_QUART...\n");
+        test_rax_quart(keys, num_keys, query_count, verbose, &ins, &qry);
+        write(pfd[1], &ins, sizeof(ins));
+        write(pfd[1], &qry, sizeof(qry));
+        close(pfd[1]);
+        zfree(keys);
+        exit(0);
+    }
+    close(pfd[1]);
+    if (read(pfd[0], &quart_insert_time, sizeof(quart_insert_time)) != (ssize_t)sizeof(quart_insert_time) ||
+        read(pfd[0], &quart_query_time,  sizeof(quart_query_time))  != (ssize_t)sizeof(quart_query_time)) {
+        fprintf(stderr, "Error: failed to read QuART results from child\n");
+        return 1;
+    }
+    close(pfd[0]);
+    waitpid(pid, NULL, 0);
+
     // Print results
     if (verbose) {
         printf("\n========================================\n");
