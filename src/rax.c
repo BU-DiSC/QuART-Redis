@@ -197,6 +197,7 @@ rax *raxNewWithMetadata(int metaSize, size_t *alloc_size) {
     rax->numele = 0;
     rax->numnodes = 1;
     rax->alloc_size = alloc_size;
+    rax->gen = 0;
     if (rax->alloc_size) *rax->alloc_size += usable;
     rax->head = raxNewNode(rax, 0, 0);
     if (rax->head == NULL) {
@@ -513,6 +514,7 @@ static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode 
  * be set to 0.
  */
 int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite) {
+    rax->gen++; /* the tree may change: raxQuart caches become invalid */
     size_t i, usable;
     int j = 0; /* Split position. If raxLowWalk() stops in a compressed
                   node, the index 'j' represents the char we stopped within the
@@ -1034,6 +1036,7 @@ raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
 /* Remove the specified item. Returns 1 if the item was found and
  * deleted, 0 otherwise. */
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
+    rax->gen++; /* the tree may change: raxQuart caches become invalid */
     raxNode *h;
     raxStack ts;
 

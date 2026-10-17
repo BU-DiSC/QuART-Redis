@@ -763,7 +763,7 @@ void dismissHashObject(robj *o, size_t size_hint) {
 /* See dismissObject() */
 void dismissStreamObject(robj *o, size_t size_hint) {
     stream *s = o->ptr;
-    rax *rax = s->tree.rax;
+    rax *rax = streamRax(s);
     if (raxSize(rax) == 0) return;
 
     /* Iterate only on stream entries, although size_hint may include serialized

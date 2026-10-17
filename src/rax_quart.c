@@ -1,9 +1,17 @@
-/* Redis rax with QuART optimizations: bridge detection and reset counter
+/* rax_quart.c -- QuART's stail fast path and tail cache for Redis' rax.
  *
- * Implementation of fast-path optimizations on top of standard rax.
+ * Copyright (c) 2026, Redis Ltd.
+ * All rights reserved.
+ *
+ * See rax_quart.h for the design. quartInsertFrom() mirrors
+ * raxGenericInsert() of rax.c for fixed-length keys, with two additions:
+ *  - anchor tracking: while inserting, remember the deepest node on the key's
+ *    path that begins at depth <= group_depth; it becomes fp when done.
+ *  - fp preservation: an insert that must not move fp (OTHER) repairs fp when
+ *    it reallocates the node holding fp's slot (case A) or splits the
+ *    compressed node whose single child is fp (case B).
  */
 
-#include "server.h"
 #include "rax_quart.h"
 #include "rax.h"
 #include "rax_malloc.h"
@@ -11,10 +19,7 @@
 #include <string.h>
 #include <errno.h>
 
-/* Default reset threshold */
-#define DEFAULT_RESET_THRESHOLD 16
-
-/* Declare internal rax functions we need for fp-based insertion */
+/* Internal rax functions used for the fast-path insertion. */
 extern raxNode *raxAddChild(rax *rax, raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink);
 extern raxNode *raxCompressNode(rax *rax, raxNode *n, unsigned char *s, size_t len, raxNode **child);
 extern raxNode *raxReallocForData(rax *rax, raxNode *n, void *data);
@@ -41,78 +46,122 @@ extern void *raxGetData(raxNode *n);
     (((n)->iskey && !(n)->isnull) ? sizeof(void*) : 0) \
 ))
 
-/* Fast-path insertion starting from fp_ref (QuART-style).
- * Inserts starting at rq->fp_ref/rq->fp_depth instead of from the root.
- * This is a specialized version of raxInsert() for fixed 4-byte keys.
- *
- * Returns 1 if inserted, 0 if key existed or on OOM (errno=ENOMEM on OOM).
- */
-static int raxQuartChangeFp(raxQuart *rq, unsigned char *key_bytes, void *data) {
-    if (!rq || !rq->rax || !rq->fp_ref || !*rq->fp_ref) {
-        errno = 0;
-        return 0;
-    }
+static raxQuartStats g_stats; /* process-wide totals */
+#define STAT(rq, field) do { (rq)->stats.field++; g_stats.field++; } while (0)
 
+/* Does the child-pointer slot 'slot' live inside the (non-compressed) node
+ * 'n'? Such a slot moves when 'n' is reallocated. */
+static inline int slotInsideNode(raxNode *n, raxNode **slot) {
+    if (n->iscompr) return 0;
+    raxNode **base = raxNodeFirstChildPtr(n);
+    return slot >= base && slot < base + n->size;
+}
+
+/* Is 'a' equal to 'b'+1, both read as big-endian integers of 'n' bytes? */
+static int prefixIsSuccessor(const unsigned char *a, const unsigned char *b, size_t n) {
+    unsigned char t[RAX_QUART_MAX_KEYLEN];
+    memcpy(t, b, n);
+    int k = (int)n - 1;
+    while (k >= 0) {
+        if (++t[k] != 0) break; /* no carry */
+        k--;
+    }
+    if (k < 0) return 0; /* b was all 0xFF: no successor */
+    return memcmp(a, t, n) == 0;
+}
+
+/* Insert 'key' (rq->keylen bytes) starting at the node pointed to by
+ * *start_ref, which begins at key depth 'start_depth'. The bytes
+ * key[0..start_depth) must be the path to that node.
+ *
+ *   anchor:   track the deepest node on the key's path that begins at depth
+ *             <= group_depth and make it fp when done.
+ *   preserve: keep the current fp valid across the node reallocations and
+ *             compressed-node splits this insert performs.
+ *
+ * '*leaf' receives the node that holds the key's value.
+ * Returns 1 if the key was inserted, 0 if it existed (value replaced, *old
+ * set) or on out of memory (errno = ENOMEM). */
+static int quartInsertFrom(raxQuart *rq, raxNode **start_ref, size_t start_depth,
+                           const unsigned char *key, void *data, void **old,
+                           int anchor, int preserve, int overwrite, raxNode **leaf)
+{
     rax *rax = rq->rax;
-    raxNode *h = *rq->fp_ref;
-    raxNode **parentlink = rq->fp_ref;
-    size_t len = 4;
-    size_t i = (rq->fp_depth < 0) ? 0 : (size_t)rq->fp_depth;
+    const size_t len = rq->keylen;
+    const size_t D = rq->group_depth;
+    raxNode **parentlink = start_ref;   /* slot pointing to h */
+    raxNode *h = *start_ref;
+    size_t i = start_depth;             /* key bytes consumed */
+    size_t depth = start_depth;         /* key depth at which h begins */
     size_t j = 0;
     size_t usable;
     size_t dummy, *alloc_size = &dummy;
     if (rax->alloc_size) alloc_size = rax->alloc_size;
 
-    /* Walk from the cached node following the remaining bytes. */
+    raxNode **best_link = start_ref;
+    size_t best_depth = start_depth;
+#define TRACK(link, d) do { if (anchor && (d) <= D) { best_link = (link); best_depth = (d); } } while (0)
+#define ANCHOR() do { if (anchor) { rq->fp_ref = best_link; rq->fp_depth = (int)best_depth; } } while (0)
+
+    *leaf = NULL;
+
+    /* Walk down while the key matches the tree. */
     while (h->size && i < len) {
         unsigned char *v = h->data;
-
         if (h->iscompr) {
-            for (j = 0; j < h->size && i < len; j++, i++) {
-                if (v[j] != key_bytes[i]) break;
-            }
+            for (j = 0; j < h->size && i < len; j++, i++)
+                if (v[j] != key[i]) break;
             if (j != h->size) break;
         } else {
-            for (j = 0; j < h->size; j++) {
-                if (v[j] == key_bytes[i]) break;
-            }
+            for (j = 0; j < h->size; j++)
+                if (v[j] == key[i]) break;
             if (j == h->size) break;
             i++;
         }
-
         raxNode **children = raxNodeFirstChildPtr(h);
         if (h->iscompr) j = 0;
         raxNode *next;
         memcpy(&next, children + j, sizeof(next));
         parentlink = children + j;
         h = next;
+        depth = i;
+        TRACK(parentlink, depth);
         j = 0;
     }
 
-    /* Key exists / can be represented by current node. */
+    /* The key is already represented by node h. */
     if (i == len && (!h->iscompr || j == 0)) {
-        if (!h->iskey) {
+        if (h->iskey && (!h->isnull || !overwrite)) {
+            if (old) *old = raxGetData(h);
+            if (overwrite) raxSetData(h, data);
+            *leaf = h;
+            ANCHOR();
+            errno = 0;
+            return 0;
+        }
+        {
+            ptrdiff_t fp_off = -1;
+            if (preserve && slotInsideNode(h, rq->fp_ref))
+                fp_off = rq->fp_ref - raxNodeFirstChildPtr(h);
             raxNode *newh = raxReallocForData(rax, h, data);
-            if (newh == NULL) {
-                errno = ENOMEM;
-                return 0;
-            }
+            if (newh == NULL) { errno = ENOMEM; return 0; }
+            int was_key = h->iskey;
             h = newh;
+            if (fp_off >= 0) rq->fp_ref = raxNodeFirstChildPtr(h) + fp_off;
             memcpy(parentlink, &h, sizeof(h));
             raxSetData(h, data);
-            rax->numele++;
+            if (!was_key) rax->numele++;
+            *leaf = h;
+            ANCHOR();
             errno = 0;
-            return 1;
+            return was_key ? 0 : 1;
         }
-
-        /* Existing key: overwrite to match raxInsert() semantics. */
-        raxSetData(h, data);
-        errno = 0;
-        return 0;
     }
 
-    /* Split compressed node on mismatch (ALGO 1 in raxGenericInsert). */
     if (h->iscompr && i != len) {
+        /* Mismatch inside a compressed node: split it (ALGO 1 of rax.c).
+         * h = [trimmed: h->data[0..j)] -> splitnode [h->data[j]] ->
+         *     [postfix: h->data[j+1..)] -> next */
         raxNode **childfield = raxNodeLastChildPtr(h);
         raxNode *next;
         memcpy(&next, childfield, sizeof(next));
@@ -132,13 +181,11 @@ static int raxQuartChangeFp(raxQuart *rq, unsigned char *key_bytes, void *data) 
             trimmed = rax_malloc_usable(nodesize, &usable);
             *alloc_size += usable;
         }
-
         if (postfixlen) {
             nodesize = sizeof(raxNode) + postfixlen + raxPadding(postfixlen) + sizeof(raxNode*);
             postfix = rax_malloc_usable(nodesize, &usable);
             *alloc_size += usable;
         }
-
         if (splitnode == NULL || (trimmedlen && trimmed == NULL) || (postfixlen && postfix == NULL)) {
             raxFreeNode(rax, splitnode);
             raxFreeNode(rax, trimmed);
@@ -150,6 +197,7 @@ static int raxQuartChangeFp(raxQuart *rq, unsigned char *key_bytes, void *data) 
         splitnode->data[0] = h->data[j];
 
         if (j == 0) {
+            /* splitnode replaces h in its parent's slot: same start depth. */
             if (h->iskey) {
                 void *ndata = raxGetData(h);
                 raxSetData(splitnode, ndata);
@@ -170,6 +218,7 @@ static int raxQuartChangeFp(raxQuart *rq, unsigned char *key_bytes, void *data) 
             memcpy(parentlink, &trimmed, sizeof(trimmed));
             parentlink = cp;
             rax->numnodes++;
+            TRACK(parentlink, depth + j); /* splitnode begins at depth+j */
         }
 
         if (postfixlen) {
@@ -188,509 +237,157 @@ static int raxQuartChangeFp(raxQuart *rq, unsigned char *key_bytes, void *data) 
         raxNode **splitchild = raxNodeLastChildPtr(splitnode);
         memcpy(splitchild, &postfix, sizeof(postfix));
 
-        raxFreeNode(rax, h);
-        h = splitnode;
-    } else if (h->iscompr && i == len) {
-        /* Fixed-length 4-byte keys should never end inside a longer compressed node.
-         * If it happens (fp_depth misuse), bail out safely. */
-        errno = 0;
-        return 0;
-    }
-
-    /* Insert the missing suffix starting from node h (like raxGenericInsert). */
-    while (i < len) {
-        raxNode *child;
-
-        if (h->size == 0 && len - i > 1) {
-            size_t comprsize = len - i;
-            if (comprsize > RAX_NODE_MAX_SIZE) comprsize = RAX_NODE_MAX_SIZE;
-            raxNode *newh = raxCompressNode(rax, h, key_bytes + i, comprsize, &child);
-            if (newh == NULL) {
-                errno = ENOMEM;
-                return 0;
-            }
-            h = newh;
-            memcpy(parentlink, &h, sizeof(h));
-            parentlink = raxNodeLastChildPtr(h);
-            i += comprsize;
-        } else {
-            raxNode **new_parentlink;
-            raxNode *newh = raxAddChild(rax, h, key_bytes[i], &child, &new_parentlink);
-            if (newh == NULL) {
-                errno = ENOMEM;
-                return 0;
-            }
-            h = newh;
-            memcpy(parentlink, &h, sizeof(h));
-            parentlink = new_parentlink;
-            i++;
-        }
-        rax->numnodes++;
-        h = child;
-    }
-
-    raxNode *newh = raxReallocForData(rax, h, data);
-    if (newh == NULL) {
-        errno = ENOMEM;
-        return 0;
-    }
-    h = newh;
-    if (!h->iskey) rax->numele++;
-    raxSetData(h, data);
-    memcpy(parentlink, &h, sizeof(h));
-    errno = 0;
-    return 1;
-}
-
-/* Convert 32-bit key to byte array (big-endian) */
-static inline void keyToBytes(uint32_t key, unsigned char *bytes) {
-    bytes[0] = (key >> 24) & 0xFF;
-    bytes[1] = (key >> 16) & 0xFF;
-    bytes[2] = (key >> 8) & 0xFF;
-    bytes[3] = key & 0xFF;
-}
-
-/* Extract byte at position from 32-bit key */
-static inline uint8_t getKeyByte(uint32_t key, int pos) {
-    return (key >> (24 - pos * 8)) & 0xFF;
-}
-
-/* Update fp_ref/fp_depth to a good fp node for this key.
- *
- * QuART semantics: fp points to the deepest node on the fp path (ideally the
- * node that begins exactly at depth 3 for 4-byte keys, so the last byte can be
- * inserted as an edge from that node). If depth 3 lies inside a compressed
- * node, we keep fp at the deepest node start <= 3.
- */
-static void updateFpRefToKey(raxQuart *rq, unsigned char *key_bytes) {
-    if (!rq || !rq->rax || !rq->rax->head) return;
-    
-    raxNode *h = rq->rax->head;
-    raxNode **parentlink = &rq->rax->head;
-
-    int depth = 0;            /* How many key bytes consumed. */
-    int node_depth = 0;       /* Depth where current node begins. */
-    raxNode **best_link = parentlink;
-    int best_depth = 0;
-
-    /* Walk the tree following key_bytes. Track the deepest node start <= 3. */
-    while (h && depth < 4) {
-        if (node_depth <= 3 && node_depth >= best_depth) {
-            best_link = parentlink;
-            best_depth = node_depth;
-        }
-
-        if (node_depth == 3) break; /* Ideal fp node. */
-
-        if (h->iscompr) {
-            unsigned char *v = h->data;
-            int match_len = 0;
-            while (match_len < (int)h->size && depth < 4 && v[match_len] == key_bytes[depth]) {
-                match_len++;
-                depth++;
-                if (depth == 3) {
-                    /* Depth 3 is inside this compressed node: keep fp at its start. */
-                    break;
-                }
-            }
-            if (match_len < (int)h->size && depth < 3) break; /* Mismatch before fp point. */
-            if (depth >= 3) break;
-
-            raxNode **cp = raxNodeFirstChildPtr(h);
-            if (!cp || !*cp) break;
-            parentlink = cp;
-            h = *cp;
-            node_depth = depth;
-        } else {
-            unsigned char *v = h->data;
-            int found = -1;
-            for (int k = 0; k < (int)h->size; k++) {
-                if (v[k] == key_bytes[depth]) {
-                    found = k;
-                    break;
-                }
-            }
-            if (found < 0) break;
-            depth++;
-            raxNode **children = raxNodeFirstChildPtr(h);
-            if (!children || !children[found]) break;
-            parentlink = &children[found];
-            h = children[found];
-            node_depth = depth;
-        }
-    }
-
-    rq->fp_ref = best_link;
-    rq->fp_depth = best_depth;
-}
-
-/* Insert a key while preserving fp_ref/fp_depth.
- *
- * Mirrors insert_recursive_preserve_fp from QuART_stail: calls raxInsert
- * from the root, then repairs fp_ref in O(1) using the known diverge byte.
- *
- * diverge_byte: index (0-2) of the first byte where new key differed from
- *   last_key.  raxInsert can only invalidate fp_ref if it mutated the node
- *   at depth fp_depth-1 (fp's parent).  That parent sits on the shared
- *   prefix of new key and last_key, so it can only be touched when the
- *   insert path reaches depth fp_depth-1, i.e. diverge_byte >= fp_depth-1.
- *   In that case reset fp to root (O(1)); the next fast-path insert will
- *   re-anchor it naturally via updateFpRefToKey.  When diverge_byte is
- *   strictly less than fp_depth-1 the parent is not on the insert path
- *   and fp_ref stays valid unchanged.
- *
- * Returns result of raxInsert.
- */
-
-
-/* Full from-root insert that surgically repairs fp_ref when nodes are
- * reallocated, instead of just resetting fp to root.
- *
- * Mirrors insert_recursive_preserve_fp from QuART_stail: walks the trie from
- * the real root, tracks fp_parent_depth, and:
- *   Case A – raxAddChild may realloc the non-compressed node that contains
- *             fp_ref; save the slot offset and restore after the call.
- *   Case B – a compressed node that is fp itself gets split; redirect fp_ref
- *             to the new split-child pointer slot.
- *
- * fp_ref and fp_depth are left untouched when neither case fires, so the
- * fast-path fp pointer stays valid for the next sequential insert.
- */
-static int raxQuartInsertPreserveFp(raxQuart *rq, unsigned char *key_bytes,
-                                    void *data, void **old) {
-    rax *rax = rq->rax;
-    raxNode *h = rax->head;
-    raxNode **parentlink = &rax->head;
-    size_t len = 4;
-    size_t i = 0, j = 0;
-    size_t depth = 0;          /* key-byte offset of current node h */
-    size_t usable;
-    size_t dummy, *alloc_size = &dummy;
-    if (rax->alloc_size) alloc_size = rax->alloc_size;
-
-    /* fp_parent_depth: key-byte depth of fp's non-compressed parent.
-     * raxAddChild on that parent may realloc it, invalidating fp_ref.
-     * Guard value (size_t)-1 means fp_depth==0 (fp IS rax->head, never moved). */
-    size_t fp_parent_depth = (rq->fp_depth > 0) ? (size_t)(rq->fp_depth - 1) : (size_t)-1;
-
-    /* ── Walk phase ──────────────────────────────────────────────────────── */
-    while (h->size && i < len) {
-        unsigned char *v = h->data;
-        size_t step;           /* key bytes consumed by this edge */
-        if (h->iscompr) {
-            for (j = 0; j < h->size && i < len; j++, i++) {
-                if (v[j] != key_bytes[i]) break;
-            }
-            if (j != h->size) break;
-            step = h->size;
-        } else {
-            for (j = 0; j < h->size; j++) {
-                if (v[j] == key_bytes[i]) break;
-            }
-            if (j == h->size) break;
-            i++;
-            step = 1;
-        }
-        raxNode **children = raxNodeFirstChildPtr(h);
-        if (h->iscompr) j = 0;
-        raxNode *next;
-        memcpy(&next, children + j, sizeof(next));
-        parentlink = children + j;
-        h = next;
-        depth += step;
-        j = 0;
-    }
-
-    /* ── Key already exists ─────────────────────────────────────────────── */
-    if (i == len && (!h->iscompr || j == 0)) {
-        if (!h->iskey) {
-            raxNode *newh = raxReallocForData(rax, h, data);
-            if (!newh) { errno = ENOMEM; return 0; }
-            h = newh;
-            memcpy(parentlink, &h, sizeof(h));
-            raxSetData(h, data);
-            rax->numele++;
-            errno = 0;
-            return 1;
-        }
-        if (old) *old = raxGetData(h);
-        raxSetData(h, data);
-        errno = 0;
-        return 0;
-    }
-
-    /* ── Compressed node split (Case B fp fixup may apply) ──────────────── */
-    if (h->iscompr && i != len) {
-        raxNode **childfield = raxNodeLastChildPtr(h);
-        raxNode *next;
-        memcpy(&next, childfield, sizeof(next));
-
-        size_t trimmedlen = j;
-        size_t postfixlen  = h->size - j - 1;
-        int split_node_is_key = !trimmedlen && h->iskey && !h->isnull;
-        size_t nodesize;
-
-        raxNode *splitnode = raxNewNode(rax, 1, split_node_is_key);
-        raxNode *trimmed   = NULL;
-        raxNode *postfix   = NULL;
-
-        if (trimmedlen) {
-            nodesize = sizeof(raxNode) + trimmedlen + raxPadding(trimmedlen) + sizeof(raxNode *);
-            if (h->iskey && !h->isnull) nodesize += sizeof(void *);
-            trimmed = rax_malloc_usable(nodesize, &usable);
-            *alloc_size += usable;
-        }
-        if (postfixlen) {
-            nodesize = sizeof(raxNode) + postfixlen + raxPadding(postfixlen) + sizeof(raxNode *);
-            postfix = rax_malloc_usable(nodesize, &usable);
-            *alloc_size += usable;
-        }
-        if (splitnode == NULL ||
-            (trimmedlen && trimmed == NULL) ||
-            (postfixlen && postfix == NULL)) {
-            raxFreeNode(rax, splitnode);
-            raxFreeNode(rax, trimmed);
-            raxFreeNode(rax, postfix);
-            errno = ENOMEM;
-            return 0;
-        }
-
-        splitnode->data[0] = h->data[j];
-
-        if (j == 0) {
-            if (h->iskey) { void *nd = raxGetData(h); raxSetData(splitnode, nd); }
-            memcpy(parentlink, &splitnode, sizeof(splitnode));
-        } else {
-            trimmed->size   = j;
-            memcpy(trimmed->data, h->data, j);
-            trimmed->iscompr = j > 1 ? 1 : 0;
-            trimmed->iskey   = h->iskey;
-            trimmed->isnull  = h->isnull;
-            if (h->iskey && !h->isnull) { void *nd = raxGetData(h); raxSetData(trimmed, nd); }
-            raxNode **cp = raxNodeLastChildPtr(trimmed);
-            memcpy(cp, &splitnode, sizeof(splitnode));
-            memcpy(parentlink, &trimmed, sizeof(trimmed));
-            parentlink = cp;
-            rax->numnodes++;
-        }
-        if (postfixlen) {
-            postfix->iskey   = 0;
-            postfix->isnull  = 0;
-            postfix->size    = postfixlen;
-            postfix->iscompr = postfixlen > 1;
-            memcpy(postfix->data, h->data + j + 1, postfixlen);
-            raxNode **cp = raxNodeLastChildPtr(postfix);
-            memcpy(cp, &next, sizeof(next));
-            rax->numnodes++;
-        } else {
-            postfix = next;
-        }
-
-        raxNode **splitchild = raxNodeLastChildPtr(splitnode);
-        memcpy(splitchild, &postfix, sizeof(postfix));
-
-        /* Case B: fp_ref points to h's single child (= fp itself).  h is
-         * being freed; redirect fp_ref so it still points to fp.
-         * If postfixlen > 0 then fp is now postfix's child, not splitnode's
-         * child; use raxNodeLastChildPtr(postfix) in that case. */
-        if (rq->fp_ref == raxNodeFirstChildPtr(h)) {
-            if (postfixlen > 0) {
+        /* Case B: fp is h's single child and h is going away; point fp_ref
+         * at the slot that now holds that child. */
+        if (preserve && rq->fp_ref == childfield) {
+            if (postfixlen > 0)
                 rq->fp_ref = raxNodeLastChildPtr(postfix);
-            } else {
-                rq->fp_ref = splitchild;  /* splitchild == &next == fp */
-            }
-            /* fp_depth unchanged: fp itself did not move. */
+            else
+                rq->fp_ref = splitchild;
         }
 
         raxFreeNode(rax, h);
         h = splitnode;
     } else if (h->iscompr && i == len) {
-        errno = 0;
-        return 0; /* 4-byte keys never end inside a longer compressed node */
+        /* The key ends inside a compressed node: only possible with keys of
+         * different lengths. Nothing was modified yet: let rax handle it. */
+        raxQuartInvalidate(rq);
+        return overwrite ? raxInsert(rax, (unsigned char*)key, len, data, old)
+                         : raxTryInsert(rax, (unsigned char*)key, len, data, old);
     }
 
-    /* ── Insert missing suffix (Case A fp fixup may apply once) ─────────── */
+    /* Insert the missing suffix starting from node h. */
     while (i < len) {
         raxNode *child;
-
         if (h->size == 0 && len - i > 1) {
-            /* Empty node → compress remaining bytes.  h has no children so
-             * fp_ref cannot live inside it. */
+            /* h has no children: compress the remaining bytes into it. */
             size_t comprsize = len - i;
             if (comprsize > RAX_NODE_MAX_SIZE) comprsize = RAX_NODE_MAX_SIZE;
-            raxNode *newh = raxCompressNode(rax, h, key_bytes + i, comprsize, &child);
-            if (!newh) { errno = ENOMEM; return 0; }
+            raxNode *newh = raxCompressNode(rax, h, (unsigned char*)key + i, comprsize, &child);
+            if (newh == NULL) { errno = ENOMEM; return 0; }
             h = newh;
             memcpy(parentlink, &h, sizeof(h));
             parentlink = raxNodeLastChildPtr(h);
             i += comprsize;
-            depth += comprsize;
         } else {
-            /* Non-compressed add.
-             * Case A: if h is fp's non-compressed parent (depth == fp_parent_depth),
-             * raxAddChild may realloc h and invalidate fp_ref (a child-pointer slot
-             * inside h).  Also, raxAddChild inserts the new byte in sorted order,
-             * so all existing slot indices >= insertion_pos shift by 1 – we must
-             * account for that too. */
+            /* Add key[i] as a new child of h. raxAddChild reallocates h,
+             * which moves every slot inside it. Case A: fp_ref is one of
+             * those slots; restore it by offset, accounting for the shift
+             * when the new byte sorts before fp's byte. */
             ptrdiff_t fp_off = -1;
             unsigned char fp_edge_byte = 0;
-            if (depth == fp_parent_depth && !h->iscompr) {
-                raxNode **fp_base = raxNodeFirstChildPtr(h);
-                ptrdiff_t off = rq->fp_ref - fp_base;
-                if (off >= 0 && (size_t)off < h->size) {
-                    fp_off = off;
-                    fp_edge_byte = h->data[off]; /* edge byte for fp's child */
-                }
+            if (preserve && slotInsideNode(h, rq->fp_ref)) {
+                fp_off = rq->fp_ref - raxNodeFirstChildPtr(h);
+                fp_edge_byte = h->data[fp_off];
             }
             raxNode **new_parentlink;
-            raxNode *newh = raxAddChild(rax, h, key_bytes[i], &child, &new_parentlink);
-            if (!newh) { errno = ENOMEM; return 0; }
-
-            /* Case A fixup: if node was reallocated, repair fp_ref.
-             * Also adjust fp_off when the new byte sorts before fp's edge byte
-             * (raxAddChild shifts all slots at or after the insertion point). */
+            raxNode *newh = raxAddChild(rax, h, key[i], &child, &new_parentlink);
+            if (newh == NULL) { errno = ENOMEM; return 0; }
             if (fp_off >= 0) {
-                if ((unsigned char)key_bytes[i] < fp_edge_byte)
-                    fp_off++; /* insertion was before fp's slot → slot shifted */
+                if (key[i] < fp_edge_byte) fp_off++;
                 rq->fp_ref = raxNodeFirstChildPtr(newh) + fp_off;
             }
-
             h = newh;
             memcpy(parentlink, &h, sizeof(h));
             parentlink = new_parentlink;
             i++;
-            depth++;
+            TRACK(parentlink, i); /* the new child begins at depth i */
         }
         rax->numnodes++;
         h = child;
     }
 
-    /* ── Attach data at the new leaf ────────────────────────────────────── */
+    /* Attach the value at the leaf. */
     raxNode *newh = raxReallocForData(rax, h, data);
-    if (!newh) { errno = ENOMEM; return 0; }
+    if (newh == NULL) { errno = ENOMEM; return 0; }
     h = newh;
     if (!h->iskey) rax->numele++;
     raxSetData(h, data);
     memcpy(parentlink, &h, sizeof(h));
+    *leaf = h;
+    ANCHOR();
     errno = 0;
     return 1;
+#undef TRACK
+#undef ANCHOR
 }
 
-raxQuart *raxQuartNewWithMetadata(int metaSize, size_t *alloc_size) {
-    raxQuart *rq = zmalloc(sizeof(raxQuart));
-    if (!rq) return NULL;
-
-    rq->rax = raxNewWithMetadata(metaSize, alloc_size);
-    if (!rq->rax) {
-        zfree(rq);
-        return NULL;
+/* Remember 'leaf' as the tail if 'key' is the largest key seen. */
+static inline void quartNoteLeaf(raxQuart *rq, const unsigned char *key, raxNode *leaf) {
+    if (leaf == NULL) return;
+    if (!rq->has_tail || memcmp(key, rq->tail_key, rq->keylen) >= 0) {
+        rq->tail_node = leaf;
+        memcpy(rq->tail_key, key, rq->keylen);
+        rq->has_tail = 1;
     }
-
-    rq->last_key = 0;
-    rq->fp_ref = &rq->rax->head;
-    rq->fp_depth = 0;
-    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-    rq->has_last_key = 0;
-
-    return rq;
 }
 
-raxQuart *raxQuartNew(void) {
-    raxQuart *rq = zmalloc(sizeof(raxQuart));
-    if (!rq) return NULL;
-    
-    rq->rax = raxNew();
-    if (!rq->rax) {
-        zfree(rq);
-        return NULL;
+/* Drop the caches if the tree was mutated behind the wrapper's back. */
+static inline void quartSync(raxQuart *rq) {
+    if (rq->rax->gen != rq->gen) raxQuartInvalidate(rq);
+}
+
+static int quartInsert(raxQuart *rq, unsigned char *key, size_t keylen, void *data, void **old, int overwrite) {
+    if (!rq) return 0;
+    quartSync(rq);
+    if ((int)keylen != rq->keylen) {
+        /* Foreign key length: plain insert; the caches may now be stale. */
+        int r = overwrite ? raxInsert(rq->rax, key, keylen, data, old)
+                          : raxTryInsert(rq->rax, key, keylen, data, old);
+        raxQuartInvalidate(rq);
+        return r;
     }
-    
-    rq->last_key = 0;
-    rq->fp_ref = &rq->rax->head;  /* Initially points to root */
-    rq->fp_depth = 0;              /* Start at depth 0 */
-    rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-    rq->has_last_key = 0;
-    
-    return rq;
+
+    raxNode *leaf = NULL;
+    int result;
+    const size_t D = rq->group_depth;
+
+    if (!rq->has_fp_key) {
+        /* First key: insert from the root and anchor fp on it. */
+        result = quartInsertFrom(rq, &rq->rax->head, 0, key, data, old, 1, 0, overwrite, &leaf);
+        if (errno == ENOMEM) { raxQuartInvalidate(rq); return 0; }
+        memcpy(rq->fp_key, key, keylen);
+        rq->has_fp_key = 1;
+        rq->reset_counter = RAX_QUART_RESET_THRESHOLD;
+    } else if (memcmp(key, rq->fp_key, D) == 0) {
+        /* FP_INSERT: same prefix group, insert starting at fp. */
+        STAT(rq, fp_insert);
+        rq->reset_counter = RAX_QUART_RESET_THRESHOLD;
+        result = quartInsertFrom(rq, rq->fp_ref, rq->fp_depth, key, data, old, 1, 0, overwrite, &leaf);
+        if (errno == ENOMEM) { raxQuartInvalidate(rq); return 0; }
+        memcpy(rq->fp_key, key, keylen);
+    } else if (prefixIsSuccessor(key, rq->fp_key, D) || prefixIsSuccessor(rq->fp_key, key, D)) {
+        /* BRIDGE: adjacent prefix group, the stream advanced; move fp. */
+        STAT(rq, bridge);
+        rq->reset_counter = RAX_QUART_RESET_THRESHOLD;
+        result = quartInsertFrom(rq, &rq->rax->head, 0, key, data, old, 1, 0, overwrite, &leaf);
+        if (errno == ENOMEM) { raxQuartInvalidate(rq); return 0; }
+        memcpy(rq->fp_key, key, keylen);
+    } else if (rq->reset_counter == 0) {
+        /* OTHER with the counter expired: the stream has moved; re-anchor. */
+        STAT(rq, other);
+        STAT(rq, reset);
+        rq->reset_counter = RAX_QUART_RESET_THRESHOLD;
+        result = quartInsertFrom(rq, &rq->rax->head, 0, key, data, old, 1, 0, overwrite, &leaf);
+        if (errno == ENOMEM) { raxQuartInvalidate(rq); return 0; }
+        memcpy(rq->fp_key, key, keylen);
+    } else {
+        /* OTHER: an outlier; insert from the root and keep fp. */
+        STAT(rq, other);
+        rq->reset_counter--;
+        result = quartInsertFrom(rq, &rq->rax->head, 0, key, data, old, 0, 1, overwrite, &leaf);
+        if (errno == ENOMEM) { raxQuartInvalidate(rq); return 0; }
+    }
+    quartNoteLeaf(rq, key, leaf);
+    return result;
 }
 
 int raxQuartInsert(raxQuart *rq, unsigned char *key, size_t keylen, void *data, void **old) {
-    if (!rq) return 0;
-    if (keylen != 4) return raxInsert(rq->rax, key, keylen, data, old);
+    return quartInsert(rq, key, keylen, data, old, 1);
+}
 
-    uint32_t key_int = ((uint32_t)key[0] << 24) | ((uint32_t)key[1] << 16) | ((uint32_t)key[2] << 8) | key[3];
-    unsigned char key_bytes[4];
-    memcpy(key_bytes, key, 4);
-
-    /* First insertion - always insert normally and change fp. */
-    if (!rq->has_last_key) {
-        int result = raxInsert(rq->rax, key_bytes, 4, data, old);
-        if (result) {
-            rq->last_key = key_int;
-            rq->has_last_key = 1;
-            updateFpRefToKey(rq, key_bytes);
-        }
-        return result;
-    }
-
-    /* Classify key by comparing upper 3 bytes (bytes 0-2) against last_key.
-     *
-     * FP_INSERT : upper 3 bytes are equal  → fast-path insert from fp node.
-     * BRIDGE    : upper 3 bytes differ by 1 → reset counter, reset fp, change fp.
-     * OTHER     : unrelated key             → decrement counter or reset.
-     *
-     * Mirrors getKeyType() / insert() from QuART_stail_reset_2.
-     */
-    uint32_t leafUpper = (rq->last_key >> 8) & 0xFFFFFF;
-    uint32_t keyUpper  = (key_int >> 8) & 0xFFFFFF;
-
-    if (keyUpper == leafUpper) {
-        /* FP_INSERT */
-        if (rq->reset_counter != DEFAULT_RESET_THRESHOLD)
-            rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-        int result = raxQuartChangeFp(rq, key_bytes, data);
-        if (errno == ENOMEM) return 0;
-        rq->last_key = key_int;
-        if (rq->fp_depth < 3)
-            updateFpRefToKey(rq, key_bytes);
-        return result;
-
-    } else if (((keyUpper + 1) & 0xFFFFFF) == leafUpper ||
-               ((leafUpper + 1) & 0xFFFFFF) == keyUpper) {
-        /* BRIDGE */
-        if (rq->reset_counter != DEFAULT_RESET_THRESHOLD)
-            rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-        rq->fp_ref = &rq->rax->head;
-        rq->fp_depth = 0;
-        int result = raxInsert(rq->rax, key_bytes, 4, data, old);
-        if (errno != ENOMEM) {
-            updateFpRefToKey(rq, key_bytes);
-            rq->last_key = key_int;
-        }
-        return result;
-
-    } else {
-        /* OTHER */
-        if (rq->reset_counter == 0) {
-            /* Counter expired: reset fp and reinsert from root with fp change. */
-            rq->reset_counter = DEFAULT_RESET_THRESHOLD;
-            rq->fp_ref = &rq->rax->head;
-            rq->fp_depth = 0;
-            int result = raxInsert(rq->rax, key_bytes, 4, data, old);
-            if (errno != ENOMEM) {
-                updateFpRefToKey(rq, key_bytes);
-                rq->last_key = key_int;
-            }
-            return result;
-        } else {
-            /* Decrement counter, insert from root while preserving fp. */
-            rq->reset_counter--;
-            int result = raxQuartInsertPreserveFp(rq, key_bytes, data, old);
-            if (errno != ENOMEM)
-                rq->last_key = key_int;
-            return result;
-        }
-    }
+int raxQuartTryInsert(raxQuart *rq, unsigned char *key, size_t keylen, void *data, void **old) {
+    return quartInsert(rq, key, keylen, data, old, 0);
 }
 
 int raxQuartFind(raxQuart *rq, unsigned char *key, size_t keylen, void **value) {
@@ -700,13 +397,106 @@ int raxQuartFind(raxQuart *rq, unsigned char *key, size_t keylen, void **value) 
 
 int raxQuartRemove(raxQuart *rq, unsigned char *key, size_t keylen, void **old) {
     if (!rq) return 0;
-    return raxRemove(rq->rax, key, keylen, old);
+    int r = raxRemove(rq->rax, key, keylen, old);
+    raxQuartInvalidate(rq);
+    return r;
+}
+
+int raxQuartTail(raxQuart *rq, unsigned char *key, void **data) {
+    if (!rq) return 0;
+    quartSync(rq);
+    if (!rq->has_tail) {
+        raxIterator ri;
+        raxStart(&ri, rq->rax);
+        raxSeek(&ri, "$", NULL, 0);
+        if (raxEOF(&ri) || (int)ri.key_len != rq->keylen) {
+            raxStop(&ri);
+            return 0;
+        }
+        memcpy(rq->tail_key, ri.key, rq->keylen);
+        rq->tail_node = ri.node;
+        rq->has_tail = 1;
+        raxStop(&ri);
+        STAT(rq, tail_seek);
+    } else {
+        STAT(rq, tail_hit);
+    }
+    memcpy(key, rq->tail_key, rq->keylen);
+    *data = raxGetData(rq->tail_node);
+    return 1;
+}
+
+void raxQuartSetTailData(raxQuart *rq, unsigned char *key, size_t keylen, void *data) {
+    if (!rq) return;
+    quartSync(rq);
+    if (rq->has_tail && (int)keylen == rq->keylen && memcmp(key, rq->tail_key, keylen) == 0) {
+        raxSetData(rq->tail_node, data);
+        return;
+    }
+    raxQuartInsert(rq, key, keylen, data, NULL);
+}
+
+void raxQuartInvalidate(raxQuart *rq) {
+    if (!rq) return;
+    rq->has_tail = 0;
+    rq->tail_node = NULL;
+    rq->has_fp_key = 0;
+    rq->fp_ref = &rq->rax->head;
+    rq->fp_depth = 0;
+    rq->reset_counter = RAX_QUART_RESET_THRESHOLD;
+    rq->gen = rq->rax->gen;
+}
+
+static raxQuart *quartAlloc(int keylen, int group_depth) {
+    if (keylen < 1) keylen = 1;
+    if (keylen > RAX_QUART_MAX_KEYLEN) keylen = RAX_QUART_MAX_KEYLEN;
+    if (group_depth < 0) group_depth = 0;
+    if (group_depth > keylen - 1) group_depth = keylen - 1;
+    raxQuart *rq = zcalloc(sizeof(raxQuart));
+    if (!rq) return NULL;
+    rq->keylen = keylen;
+    rq->group_depth = group_depth;
+    return rq;
+}
+
+raxQuart *raxQuartNewWithMetadata(int metaSize, size_t *alloc_size, int keylen, int group_depth) {
+    raxQuart *rq = quartAlloc(keylen, group_depth);
+    if (!rq) return NULL;
+    rq->rax = raxNewWithMetadata(metaSize, alloc_size);
+    if (!rq->rax) { zfree(rq); return NULL; }
+    rq->owns_rax = 1;
+    raxQuartInvalidate(rq);
+    return rq;
+}
+
+raxQuart *raxQuartWrap(rax *rax, int keylen, int group_depth) {
+    if (!rax) return NULL;
+    raxQuart *rq = quartAlloc(keylen, group_depth);
+    if (!rq) return NULL;
+    rq->rax = rax;
+    rq->owns_rax = 0;
+    raxQuartInvalidate(rq);
+    return rq;
+}
+
+void raxQuartUnwrap(raxQuart *rq) {
+    if (!rq) return;
+    zfree(rq);
+}
+
+raxQuart *raxQuartNew(void) {
+    raxQuart *rq = quartAlloc(4, 3);
+    if (!rq) return NULL;
+    rq->rax = raxNew();
+    if (!rq->rax) { zfree(rq); return NULL; }
+    rq->owns_rax = 1;
+    raxQuartInvalidate(rq);
+    return rq;
 }
 
 void raxQuartFree(raxQuart *rq) {
     if (!rq) return;
-    
-    if (rq->rax) raxFree(rq->rax);
+    if (rq->rax && rq->owns_rax) raxFree(rq->rax);
     zfree(rq);
 }
 
@@ -714,13 +504,18 @@ uint64_t raxQuartSize(raxQuart *rq) {
     return rq ? raxSize(rq->rax) : 0;
 }
 
+void raxQuartGlobalStats(raxQuartStats *out) {
+    *out = g_stats;
+}
+
+void raxQuartGlobalStatsReset(void) {
+    memset(&g_stats, 0, sizeof(g_stats));
+}
+
 void raxQuartSetResetThreshold(raxQuart *rq, int threshold) {
-    if (rq && threshold > 0) {
-        rq->reset_counter = threshold;
-    }
+    if (rq && threshold > 0) rq->reset_counter = threshold;
 }
 
 int raxQuartGetResetThreshold(raxQuart *rq) {
     return rq ? rq->reset_counter : -1;
 }
-

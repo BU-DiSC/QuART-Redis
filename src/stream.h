@@ -2,6 +2,7 @@
 #define STREAM_H
 
 #include "rax.h"
+#include "rax_quart.h"
 #include "listpack.h"
 #include "dict.h"
 #include "xxhash.h"
@@ -121,6 +122,7 @@ typedef struct streamCG {
     rax *consumers;         /* A radix tree representing the consumers by name
                                and their associated representation in the form
                                of streamConsumer structures. */
+    struct raxQuart *pel_quart; /* stail wrapper around pel; NULL until first use. */
 } streamCG;
 
 /* A specific consumer in a consumer group.  */
@@ -137,6 +139,7 @@ typedef struct streamConsumer {
                                    the same streamNACK structure referenced
                                    in the "pel" of the consumer group structure
                                    itself, so the value is shared. */
+    struct raxQuart *pel_quart; /* stail wrapper around pel; NULL until first use. */
 } streamConsumer;
 
 /* Pending (yet not acknowledged) message in a consumer group. */

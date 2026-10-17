@@ -15,6 +15,31 @@
 
 #include "rax_quart.h"
 
+/* stail wrapper for a pending entries list (PEL). Created on first use when
+ * stream-quart-enabled is set, re-pointed if defrag moved the rax. Mutations
+ * of the PEL that bypass the wrapper (XACK, XCLAIM transfers, RDB load,
+ * defrag) are detected through rax->gen and drop its cached pointers. */
+static inline raxQuart *pelQuart(rax *pel, raxQuart **slot) {
+    if (*slot == NULL) {
+        *slot = raxQuartWrap(pel, sizeof(streamID), server.stream_quart_group_depth);
+    } else if ((*slot)->rax != pel) {
+        (*slot)->rax = pel;
+        raxQuartInvalidate(*slot);
+    }
+    return *slot;
+}
+
+/* Insert into a PEL, through stail when enabled. overwrite=0 is raxTryInsert. */
+static inline int pelInsert(rax *pel, raxQuart **slot, unsigned char *key, size_t len, void *val, int overwrite) {
+    if (server.stream_quart_enabled) {
+        raxQuart *rq = pelQuart(pel, slot);
+        return overwrite ? raxQuartInsert(rq, key, len, val, NULL)
+                         : raxQuartTryInsert(rq, key, len, val, NULL);
+    }
+    return overwrite ? raxInsert(pel, key, len, val, NULL)
+                     : raxTryInsert(pel, key, len, val, NULL);
+}
+
 /* Every stream item inside the listpack, has a flags field that is used to
  * mark the entry as deleted, or having the same field as the "master"
  * entry at the start of the listpack> */
@@ -73,7 +98,7 @@ stream *streamNew(void) {
     s->alloc_size = usable;
     s->use_quart = server.stream_quart_enabled;
     if (s->use_quart) {
-        s->tree.quart = raxQuartNewWithMetadata(0, &s->alloc_size);
+        s->tree.quart = raxQuartNewWithMetadata(0, &s->alloc_size, sizeof(streamID), server.stream_quart_group_depth);
     } else {
         s->tree.rax = raxNewWithMetadata(0, &s->alloc_size);
     }
@@ -530,20 +555,35 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         return C_ERR;
     }
 
-    /* Add the new entry. */
-    raxIterator ri;
-    raxStart(&ri, streamRax(s));
-    raxSeek(&ri,"$",NULL,0);
-
+    /* Add the new entry: locate the tail node of the radix tree. With QuART
+     * the tail node is cached, so no root-to-tail traversal is needed. */
+    unsigned char tail_key[sizeof(streamID)]; /* Key of the tail node. */
+    unsigned char *tail_lp = NULL;  /* Listpack of the tail node, NULL if none. */
+    raxNode *tail_node = NULL;      /* Tail node (plain rax only). */
     size_t lp_bytes = 0;        /* Total bytes in the tail listpack. */
     unsigned char *lp = NULL;   /* Tail listpack pointer. */
 
-    if (!raxEOF(&ri)) {
-        /* Get a reference to the tail node listpack. */
-        lp = ri.data;
+    if (s->use_quart) {
+        void *tail_data = NULL;
+        if (raxQuartTail(s->tree.quart, tail_key, &tail_data))
+            tail_lp = tail_data;
+    } else {
+        raxIterator ri;
+        raxStart(&ri, s->tree.rax);
+        raxSeek(&ri,"$",NULL,0);
+        if (!raxEOF(&ri)) {
+            /* Get a reference to the tail node listpack. */
+            serverAssert(ri.key_len == sizeof(tail_key));
+            memcpy(tail_key, ri.key, sizeof(tail_key));
+            tail_lp = ri.data;
+            tail_node = ri.node;
+        }
+        raxStop(&ri);
+    }
+    if (tail_lp) {
+        lp = tail_lp;
         lp_bytes = lpBytes(lp);
     }
-    raxStop(&ri);
 
     /* We have to add the key into the radix tree in lexicographic order,
      * to do so we consider the ID as a single 128 bit number written in
@@ -605,8 +645,12 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
             lp = lpShrinkToFit(lp);
             s->alloc_size -= lp_bytes;
             s->alloc_size += lpBytes(lp);
-            if (ri.data != lp)
-                raxSetData(ri.node, lp);
+            if (tail_lp != lp) {
+                if (s->use_quart)
+                    raxQuartSetTailData(s->tree.quart, tail_key, sizeof(tail_key), lp);
+                else
+                    raxSetData(tail_node, lp);
+            }
             lp = NULL;
         }
     }
@@ -644,8 +688,7 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
          * master entry. */
         flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
     } else {
-        serverAssert(ri.key_len == sizeof(rax_key));
-        memcpy(rax_key,ri.key,sizeof(rax_key));
+        memcpy(rax_key,tail_key,sizeof(rax_key));
 
         /* Read the master ID from the radix tree key. */
         streamDecodeID(rax_key,&master_id);
@@ -728,10 +771,11 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     s->alloc_size -= oldsize;
     s->alloc_size += lpBytes(lp);
 
-    /* Insert back into the tree in order to update the listpack pointer. */
-    if (ri.data != lp) {
+    /* Insert back into the tree in order to update the listpack pointer.
+     * With QuART the tail node is cached and its value is replaced in place. */
+    if (tail_lp != lp) {
         if (s->use_quart) {
-            raxQuartInsert(s->tree.quart, (unsigned char*)&rax_key, sizeof(rax_key), lp, NULL);
+            raxQuartSetTailData(s->tree.quart, (unsigned char*)&rax_key, sizeof(rax_key), lp);
         } else {
             raxInsert(s->tree.rax, (unsigned char*)&rax_key, sizeof(rax_key), lp, NULL);
         }
@@ -862,6 +906,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             s->alloc_size -= lpBytes(lp);
             lpFree(lp);
             raxRemove(streamRax(s),ri.key,ri.key_len,NULL);
+            if (s->use_quart) raxQuartInvalidate(s->tree.quart);
             raxSeek(&ri,">=",ri.key,ri.key_len);
             s->length -= entries;
             deleted += entries;
@@ -962,6 +1007,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             s->alloc_size -= oldsize;
             lpFree(lp);
             raxRemove(streamRax(s),ri.key,ri.key_len,NULL);
+            if (s->use_quart) raxQuartInvalidate(s->tree.quart);
             raxSeek(&ri,">=",ri.key,ri.key_len);
             continue;
         }
@@ -1558,6 +1604,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
         s->alloc_size -= oldsize;
         lpFree(lp);
         raxRemove(streamRax(s),si->ri.key,si->ri.key_len,NULL);
+        if (s->use_quart) raxQuartInvalidate(s->tree.quart);
     } else {
         /* In the base case we alter the counters of valid/deleted entries. */
         lp = lpReplaceInteger(lp,&p,aux-1);
@@ -2052,7 +2099,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                     streamEncodeID(buf, &nack->id);
                     raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
                     nack->consumer = consumer;
-                    raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+                    pelInsert(consumer->pel,&consumer->pel_quart,buf,sizeof(buf),nack,1);
                 }
                 nack->delivery_count++;
                 pelListUpdate(group, nack, cmd_time_snapshot); /* Moves element from beginning to end of list */
@@ -2179,7 +2226,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
              * if we find that there is already an entry for this ID. */
             streamNACK *nack = streamCreateNACK(s, consumer, &id);
             int group_inserted =
-                raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+                pelInsert(group->pel,&group->pel_quart,buf,sizeof(buf),nack,0);
 
             /* Now we can check if the entry was already busy, and
              * in that case reassign the entry to the new consumer,
@@ -2194,14 +2241,14 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                 if (nack->consumer != consumer) {
                     raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
                     nack->consumer = consumer;
-                    raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+                    pelInsert(consumer->pel,&consumer->pel_quart,buf,sizeof(buf),nack,1);
                 }
                 nack->delivery_count = 1;
                 /* Update delivery time and reposition in time list */
                 pelListUpdate(group, nack, cmd_time_snapshot);
             } else {
                 /* New NACK - insert into consumer's PEL and time list */
-                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+                pelInsert(consumer->pel,&consumer->pel_quart,buf,sizeof(buf),nack,1);
                 nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
                 pelListInsertAtTail(group, nack);
             }
@@ -3216,6 +3263,7 @@ void streamFreeNACKGeneric(void *na, void *ctx) {
  * should do some work before. */
 void streamFreeConsumer(stream *s, streamConsumer *sc) {
     size_t usable;
+    if (sc->pel_quart) { raxQuartUnwrap(sc->pel_quart); sc->pel_quart = NULL; }
     raxFree(sc->pel); /* No value free callback: the PEL entries are shared
                          between the consumer and the main stream PEL. */
     s->alloc_size -= sdsAllocSize(sc->name);
@@ -3243,6 +3291,7 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     streamCG *cg = zmalloc_usable(sizeof(*cg), &usable);
     s->alloc_size += usable;
     cg->pel = raxNewWithMetadata(0, &s->alloc_size);
+    cg->pel_quart = NULL;
     cg->pel_time_head = NULL;
     cg->pel_time_tail = NULL;
     cg->consumers = raxNewWithMetadata(0, &s->alloc_size);
@@ -3258,6 +3307,7 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
 static void streamFreeCG(stream *s, streamCG *cg) {
     /* Free the pel, unlinking each NACK from the time list in the callback */
     streamFreeNACKCtx ctx = {s, cg};
+    if (cg->pel_quart) { raxQuartUnwrap(cg->pel_quart); cg->pel_quart = NULL; }
     raxFreeWithCbAndContext(cg->pel, streamFreeNACKGeneric, &ctx);
     
     /* pel_time_head/tail should now be NULL after unlinking all NACKs */
@@ -3324,6 +3374,7 @@ streamConsumer *streamCreateConsumer(stream *s, streamCG *cg, sds name, robj *ke
     consumer->name = sdsdup(name);
     s->alloc_size += sdsAllocSize(consumer->name);
     consumer->pel = raxNewWithMetadata(0, &s->alloc_size);
+    consumer->pel_quart = NULL;
     consumer->active_time = -1;
     consumer->seen_time = commandTimeSnapshot();
     if (dirty) server.dirty++;
@@ -4257,7 +4308,7 @@ void xclaimCommand(client *c) {
             }
             if (nack->consumer != consumer) {
                 /* Add the entry in the new consumer local PEL. */
-                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+                pelInsert(consumer->pel,&consumer->pel_quart,buf,sizeof(buf),nack,1);
                 nack->consumer = consumer;
             }
             /* Send the reply for this entry. */
@@ -4439,7 +4490,7 @@ void xautoclaimCommand(client *c) {
 
         if (nack->consumer != consumer) {
             /* Add the entry in the new consumer local PEL. */
-            raxInsert(consumer->pel,ri.key,ri.key_len,nack,NULL);
+            pelInsert(consumer->pel,&consumer->pel_quart,ri.key,ri.key_len,nack,1);
             nack->consumer = consumer;
         }
 

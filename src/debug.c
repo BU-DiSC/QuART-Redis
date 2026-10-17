@@ -522,10 +522,14 @@ void debugCommand(client *c) {
 "    Read N uint32_t keys from the binary workload file server-side and insert",
 "    them directly into Redis streams (stream:0, stream:1, ...) via",
 "    streamAppendItem, bypassing all client-server overhead.  Returns an array",
-"    [num_streams, insert_ns, errors].  Streams are left in the DB for querying;",
+"    [num_streams, insert_ns, errors, fp_insert, bridge, other, reset, tail_hit,",
+"    tail_seek] (the last six are QuART's counters). Streams are left in the DB;",
 "    delete them with DEBUG STREAM-BULK-CLEANUP <num_streams>.",
 "STREAM-BULK-CLEANUP <num_streams>",
 "    Delete the streams created by STREAM-BULK-INSERT.",
+"STREAM-QUART-STATS [RESET]",
+"    Return QuART's global counters [fp_insert, bridge, other, reset, tail_hit,",
+"    tail_seek] summed over all wrapped radix trees; RESET zeroes them.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -1166,7 +1170,8 @@ NULL
          * This eliminates all client-server overhead from the measurement,
          * making the RAX vs QuART index difference directly visible.
          *
-         * Returns array: [num_streams, insert_ns, errors]
+         * Returns array: [num_streams, insert_ns, errors, fp_insert, bridge,
+         *                 other, reset, tail_hit, tail_seek]
          * Streams are left in the DB for querying.
          */
         long long num_keys;
@@ -1191,6 +1196,7 @@ NULL
 
         /* Shared field robj "v" reused for every insert */
         robj *field = createStringObject("v", 1);
+        raxQuartGlobalStatsReset();
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1252,10 +1258,20 @@ NULL
 #undef SBULK_CHUNK
 
         size_t num_streams = stream_idx + 1;
-        addReplyArrayLen(c, 3);
+        raxQuartStats qs;
+        raxQuartGlobalStats(&qs);
+        /* [num_streams, insert_ns, errors, fp_insert, bridge, other, reset,
+         *  tail_hit, tail_seek] -- the last six are QuART's counters. */
+        addReplyArrayLen(c, 9);
         addReplyLongLong(c, (long long)num_streams);
         addReplyLongLong(c, insert_ns);
         addReplyLongLong(c, errors);
+        addReplyLongLong(c, (long long)qs.fp_insert);
+        addReplyLongLong(c, (long long)qs.bridge);
+        addReplyLongLong(c, (long long)qs.other);
+        addReplyLongLong(c, (long long)qs.reset);
+        addReplyLongLong(c, (long long)qs.tail_hit);
+        addReplyLongLong(c, (long long)qs.tail_seek);
 
     } else if (!strcasecmp(c->argv[1]->ptr,"stream-bulk-cleanup") && c->argc == 3) {
         /* DEBUG STREAM-BULK-CLEANUP <num_streams>
@@ -1273,6 +1289,18 @@ NULL
             decrRefCount(skey);
         }
         addReplyLongLong(c, deleted);
+
+    } else if (!strcasecmp(c->argv[1]->ptr,"stream-quart-stats") && (c->argc == 2 || c->argc == 3)) {
+        raxQuartStats qs;
+        raxQuartGlobalStats(&qs);
+        addReplyArrayLen(c, 6);
+        addReplyLongLong(c, (long long)qs.fp_insert);
+        addReplyLongLong(c, (long long)qs.bridge);
+        addReplyLongLong(c, (long long)qs.other);
+        addReplyLongLong(c, (long long)qs.reset);
+        addReplyLongLong(c, (long long)qs.tail_hit);
+        addReplyLongLong(c, (long long)qs.tail_seek);
+        if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"reset")) raxQuartGlobalStatsReset();
 
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);

@@ -1916,6 +1916,7 @@ typedef struct hotkeyStats hotkeyStats;
 
 struct redisServer {
         int stream_quart_enabled; /* If true, use QuART for streams. */
+        int stream_quart_group_depth; /* QuART prefix-group depth for 16-byte stream IDs. */
     /* General */
     pid_t pid;                  /* Main process pid. */
     pthread_t main_thread_id;         /* Main thread id */

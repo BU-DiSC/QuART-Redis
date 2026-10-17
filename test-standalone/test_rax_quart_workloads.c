@@ -17,6 +17,8 @@
 
 #define DEFAULT_QUERY_PERCENTAGE 100  // Query 100% of keys by default
 
+static int g_check = 0;  // -c: verify every inserted key by lookup
+
 /* Read binary workload file */
 uint32_t* read_workload(const char *filename, size_t num_keys) {
     FILE *fp = fopen(filename, "rb");
@@ -68,6 +70,21 @@ void test_rax(uint32_t *keys, size_t num_keys, size_t query_count, int verbose,
     long long end = get_time_ns();
     *insert_time = end - start;
     
+    if (g_check) {
+        size_t missing = 0, wrong = 0;
+        for (size_t i = 0; i < num_keys; i++) {
+            key_bytes[0] = (keys[i] >> 24) & 0xFF;
+            key_bytes[1] = (keys[i] >> 16) & 0xFF;
+            key_bytes[2] = (keys[i] >> 8) & 0xFF;
+            key_bytes[3] = keys[i] & 0xFF;
+            void *value = NULL;
+            if (!raxFind(r, key_bytes, 4, &value)) missing++;
+            else if ((uintptr_t)value != i + 1) wrong++;
+        }
+        printf("  RAX: verify %s: %zu missing, %zu with another value, size %llu of %zu keys\n",
+               missing ? "FAILED" : "OK", missing, wrong, (unsigned long long)raxSize(r), num_keys);
+        if (missing) exit(2);
+    }
     if (verbose) {
         printf("  RAX: Inserted %zu keys in %lld ns (%.2f ns/key)\n", 
                num_keys, *insert_time, (double)*insert_time / num_keys);
@@ -120,6 +137,23 @@ void test_rax_quart(uint32_t *keys, size_t num_keys, size_t query_count, int ver
     long long end = get_time_ns();
     *insert_time = end - start;
     
+    if (g_check) {
+        size_t missing = 0, wrong = 0;
+        for (size_t i = 0; i < num_keys; i++) {
+            key_bytes[0] = (keys[i] >> 24) & 0xFF;
+            key_bytes[1] = (keys[i] >> 16) & 0xFF;
+            key_bytes[2] = (keys[i] >> 8) & 0xFF;
+            key_bytes[3] = keys[i] & 0xFF;
+            void *value = NULL;
+            if (!raxQuartFind(rq, key_bytes, 4, &value)) missing++;
+            else if ((uintptr_t)value != i + 1) wrong++;
+        }
+        printf("  QuART: verify %s: %zu missing, %zu with another value, size %llu of %zu keys (fp_insert %llu, bridge %llu, other %llu, reset %llu)\n",
+               missing ? "FAILED" : "OK", missing, wrong, (unsigned long long)raxQuartSize(rq), num_keys,
+               (unsigned long long)rq->stats.fp_insert, (unsigned long long)rq->stats.bridge,
+               (unsigned long long)rq->stats.other, (unsigned long long)rq->stats.reset);
+        if (missing) exit(2);
+    }
     if (verbose) {
         printf("  QuART: Inserted %zu keys in %lld ns (%.2f ns/key)\n",
                num_keys, *insert_time, (double)*insert_time / num_keys);
@@ -182,6 +216,8 @@ int main(int argc, char **argv) {
             if (query_pct > 100) query_pct = 100;
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = 1;
+        } else if (strcmp(argv[i], "-c") == 0) {
+            g_check = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;

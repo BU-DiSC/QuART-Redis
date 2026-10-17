@@ -120,6 +120,8 @@ typedef struct rax {
     uint64_t numele;
     uint64_t numnodes;
     size_t *alloc_size;
+    uint64_t gen;        /* Bumped by raxInsert/raxRemove/defrag: lets raxQuart detect
+                            mutations that bypassed it and drop its cached pointers. */
     void *metadata[];
 } rax;
 

@@ -3157,6 +3157,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-deprecated-api", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.lua_enable_deprecated_api, 0, NULL, NULL),
     createBoolConfig("key-memory-histograms", NULL, MODIFIABLE_CONFIG, server.key_memory_histograms, 0, NULL, updateMemoryTrackingEnabled),
     createBoolConfig("stream-quart-enabled", NULL, MODIFIABLE_CONFIG, server.stream_quart_enabled, 0, NULL, NULL),
+    createIntConfig("stream-quart-group-depth", NULL, MODIFIABLE_CONFIG, 1, 15, server.stream_quart_group_depth, 7, INTEGER_CONFIG, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

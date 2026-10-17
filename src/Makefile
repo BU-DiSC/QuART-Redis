@@ -474,7 +474,7 @@ $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
 # test-rax-quart-workloads (source lives in test-standalone/)
-../test-standalone/test_rax_quart_workloads.o: ../test-standalone/test_rax_quart_workloads.c .make-prerequisites
+../test-standalone/test_rax_quart_workloads.o: ../test-standalone/test_rax_quart_workloads.c rax.h rax_quart.h .make-prerequisites
 	$(REDIS_CC) -MMD -o $@ -c $<
 
 $(TEST_RAX_QUART_WORKLOADS_NAME): ../test-standalone/test_rax_quart_workloads.o rax.o rax_quart.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o

@@ -774,10 +774,12 @@ int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) 
     serverAssert(ob->type == OBJ_STREAM && ob->encoding == OBJ_ENCODING_STREAM);
 
     stream *s = ob->ptr;
-    raxStart(&ri,s->tree.rax);
+    /* Nodes move during this scan: drop QuART's cached pointers into them. */
+    if (s->use_quart) raxQuartInvalidate(s->tree.quart);
+    raxStart(&ri,streamRax(s));
     if (*cursor == 0) {
         /* if cursor is 0, we start new iteration */
-        defragRaxNode(&s->tree.rax->head, NULL);
+        defragRaxNode(&streamRax(s)->head, NULL);
         /* assign the iterator node callback before the seek, so that the
          * initial nodes that are processed till the first item are covered */
         ri.node_cb = defragRaxNode;
@@ -834,6 +836,7 @@ typedef void *(raxDefragFunction)(raxIterator *ri, void *privdata);
  * 3) rax entry data (only if defrag_data is specified)
  * 4) call a callback per element, and allow the callback to return a new pointer for the element */
 void defragRadixTree(rax **raxref, int defrag_data, raxDefragFunction *element_cb, void *element_cb_data) {
+    (*raxref)->gen++; /* nodes move: raxQuart caches become invalid */
     raxIterator ri;
     rax* rax;
     if ((rax = activeDefragAlloc(*raxref)))
@@ -1007,14 +1010,17 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
         ob->ptr = s = news;
 
     /* Update rax back-pointer to new stream */
-    s->tree.rax->alloc_size = &s->alloc_size;
-    if (raxSize(s->tree.rax) > server.active_defrag_max_scan_fields) {
-        rax *newrax = activeDefragAlloc(s->tree.rax);
+    rax **stream_rax_ref = s->use_quart ? &s->tree.quart->rax : &s->tree.rax;
+    (*stream_rax_ref)->alloc_size = &s->alloc_size;
+    /* Defrag moves nodes: drop QuART's cached pointers into the tree. */
+    if (s->use_quart) raxQuartInvalidate(s->tree.quart);
+    if (raxSize(*stream_rax_ref) > server.active_defrag_max_scan_fields) {
+        rax *newrax = activeDefragAlloc(*stream_rax_ref);
         if (newrax)
-            s->tree.rax = newrax;
+            *stream_rax_ref = newrax;
         defragLater(ctx, ob);
     } else
-        defragRadixTree(&s->tree.rax, 1, NULL, NULL);
+        defragRadixTree(stream_rax_ref, 1, NULL, NULL);
 
     if (s->cgroups) {
         /* Update cgroups back-pointer to new stream */
