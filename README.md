@@ -1,3 +1,8 @@
+> **QuART-rax (research fork).** This fork adds QuART's *stail* fast path to Redis' radix tree `rax`
+> and contains the experiments of Section 5.3 of the paper *QuART: Quick Ingestion to ART through
+> Sortedness Awareness*. See [QUART.md](QUART.md). The fast path is off by default
+> (`stream-quart-enabled yes` turns it on); everything else is stock Redis.
+
 [![codecov](https://codecov.io/github/redis/redis/graph/badge.svg?token=6bVHb5fRuz)](https://codecov.io/github/redis/redis)
 
 This document serves as both a quick start guide to Redis and a detailed resource for building it from source.
