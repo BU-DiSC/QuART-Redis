@@ -4,7 +4,7 @@
 # Needs ../src/redis-server and ../src/redis-cli; WORK (default /tmp/quart-redis-$USER) holds logs; delete its dump.rdb between runs.
 # WORKLOAD (or WORKLOAD_DIR) selects the BoDS file whose uint32 keys become the stream IDs (default: the N=500M K=0 file).
 # usage: ab_bulk_insert.sh <N> <reps> <csv> [D values...]   (D = quart group depth; "off" = stock rax)
-R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:-/scratch/cgokmen/bods/workloads}/workload_N500000000_K0_L0.bin}
+R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:?set WORKLOAD_DIR or WORKLOAD}/workload_N500000000_K0_L0.bin}
 TMP=${WORK:-/tmp/quart-redis-$USER}; mkdir -p $TMP; N=$1; REPS=$2; CSV=$3; shift 3; CONFIGS="$@"; PORT=${PORT:-7410}
 mkfifo $TMP/nap4.fifo 2>/dev/null; nap() { read -t "$1" <> $TMP/nap4.fifo; }
 [ -f "$CSV" ] || echo "N,config,rep,insert_ns,ns_per_entry,fp_insert,bridge,other,reset,tail_hit,tail_seek" > "$CSV"

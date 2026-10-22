@@ -3,7 +3,7 @@
 # vs QuART stail on the pending lists. Variants: deliver (ascending deliveries only), ack (XACK of
 # each batch after delivery), claim (1% of inserts are older IDs re-claimed from another consumer).
 # usage: pel_bench.sh <N entries> <reps> <csv>     (needs ../src/redis-server, ../src/redis-cli)
-R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:-/scratch/cgokmen/bods/workloads}/workload_N500000000_K0_L0.bin}
+R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:?set WORKLOAD_DIR or WORKLOAD}/workload_N500000000_K0_L0.bin}
 TMP=${WORK:-/tmp/quart-redis-$USER}; mkdir -p $TMP; N=$1; REPS=$2; CSV=$3; B=10000; PORT=${PORT:-7430}
 mkfifo $TMP/nap9.fifo 2>/dev/null; nap() { read -t "$1" <> $TMP/nap9.fifo; }
 cli() { $R/redis-cli -p $PORT "$@"; }

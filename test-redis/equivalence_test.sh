@@ -1,7 +1,7 @@
 #!/bin/bash
 # Equivalence test: a QuART-enabled server and a stock server get the same operations; outputs must match.
 # usage: equivalence_test.sh [N]   (needs ../src/redis-server, ../src/redis-cli; WORKLOAD or WORKLOAD_DIR picks the BoDS file)
-R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:-/scratch/cgokmen/bods/workloads}/workload_N500000000_K0_L0.bin}
+R=$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd); W=${WORKLOAD:-${WORKLOAD_DIR:?set WORKLOAD_DIR or WORKLOAD}/workload_N500000000_K0_L0.bin}
 TMP=${WORK:-/tmp/quart-redis-$USER}; mkdir -p $TMP; N=${1:-1000000}
 rm -f $TMP/dump.rdb; rm -rf $TMP/appendonlydir; mkfifo $TMP/nap3.fifo 2>/dev/null; nap() { read -t "$1" <> $TMP/nap3.fifo; }
 start() { # $1=port $2=quart yes/no

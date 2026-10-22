@@ -17,7 +17,7 @@
 # rows of each (K, tree) and draws Figure 17.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$SCRIPT_DIR"
-WORKLOAD_DIR=${WORKLOAD_DIR:-/scratch/cgokmen/bods/workloads}
+WORKLOAD_DIR=${WORKLOAD_DIR:?set WORKLOAD_DIR to the directory of the BoDS workload files}
 WORKLOAD_N=${WORKLOAD_N:-500000000}; N=${N:-$WORKLOAD_N}; KS=${KS:-"0 1 5 10 25 100"}; REPS=${REPS:-1}
 BIN=../src/test-rax-quart-workloads
 SUFFIX=$(date +%Y%m%d_%H%M%S)

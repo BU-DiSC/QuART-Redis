@@ -30,7 +30,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_RAX_BIN="$REPO_ROOT/src/redis-server"
 DEFAULT_QUART_BIN="$REPO_ROOT/src/redis-server"  # same binary; QuART is a runtime config flag
 TEST_PROG="$REPO_ROOT/src/test-redis-stream-workloads"
-WORKLOAD_DIR="/home/grad1/cgokmen/bods/workloads/"  # same workloads as standalone test
+WORKLOAD_DIR="${WORKLOAD_DIR:?set WORKLOAD_DIR}/"  # same workloads as standalone test
 
 # ── configuration ─────────────────────────────────────────────────────────
 REDIS_PORT=7379

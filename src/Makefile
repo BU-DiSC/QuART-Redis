@@ -487,14 +487,6 @@ $(TEST_RAX_QUART_WORKLOADS_NAME): ../test-standalone/test_rax_quart_workloads.o 
 $(TEST_REDIS_STREAM_WORKLOADS_NAME): ../test-redis/test_redis_stream_workloads.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
 
-# measure-rax-depth
-measure-rax-depth: measure_rax_depth.o rax.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
-	$(REDIS_LD) -o $@ $^ $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
-
-# visualize-rax-inserts
-visualize-rax-inserts: visualize_rax_inserts.o rax.o zmalloc.o sds.o util.o crc64.o redisassert.o sha256.o crcspeed.o crccombine.o
-	$(REDIS_LD) -o $@ $^ $(FINAL_LIBS) ../deps/fpconv/fpconv_dtoa.o ../deps/fast_float/fast_float_strtod.o
-
 DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_VEC_SETS_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
 -include $(DEP)
 
